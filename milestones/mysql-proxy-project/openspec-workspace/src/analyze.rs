@@ -1350,6 +1350,11 @@ mod tests {
             ("SELECT 1 /* */", false),
             ("SELECT 1 /*", false),
             ("SELECT /*+ hint */ 1", false),
+            // A `/` that starts no comment must not consume what follows it —
+            // otherwise division swallows a live marker further along the line.
+            ("SELECT 1/2 /*! live */", true),
+            ("SELECT a/b/c /*! live */", true),
+            ("SELECT 1/2", false),
             // -- `#` line comments -----------------------------------------
             ("SELECT 1 # /*! inert */", false),
             ("SELECT 1 # inert\n", false),

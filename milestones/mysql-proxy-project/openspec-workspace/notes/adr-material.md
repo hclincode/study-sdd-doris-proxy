@@ -195,3 +195,84 @@ does not: `QueryResultWriter<'a, W>` is covariant in `'a` (it holds only
 `&'a mut PacketWriter<W>`), so the writer is reborrowed at the local lifetime and
 `start(&local_columns)` compiles. Recorded because it looks like a blocker and
 cost time to establish that it is not.
+
+## Mutation testing over `src/rewrite.rs` (task 7.8)
+
+Not the counts. The counts — 132 caught, 44 missed — would have supported almost
+any conclusion. What was worth having came from re-deriving each survivor by
+hand: applying the mutant to a copy of the file and running the suite, rather
+than reading the code and judging whether a test would have caught it.
+
+That method mattered, because reasoning about it was unreliable. Two examples
+from the same afternoon, in opposite directions:
+
+- A test written specifically to kill `delete ! in Verifier::visit_write_target`
+  used an `UPDATE`. `walk_update` routes its target through
+  `walk_table_with_joins`, so it reaches `visit_relation` and **never calls
+  `visit_write_target` at all**. The test asserted the right outcome by the wrong
+  path and would not have killed the mutant it was written for. Only `INSERT`
+  reaches that method without also walking the target as a relation.
+- The `alias.is_some()` exit in `is_guard` was predicted to be an equivalent
+  mutant. That is true of *deleting* the check and false of *returning `true`*
+  there, because that exit precedes the whole-query comparison — so a subquery
+  with no predicate at all would be waved through. The prediction was sound about
+  one mutation and wrong about the one actually under test.
+
+### The question worth asking of any check: which direction does the suite drive it?
+
+`is_guard` returns `false` from seven places. Four near-miss tests existed, and
+**all four failed recognition at the same one** — the final whole-query
+comparison. One gate had been tested four times and five others not at all, while
+the function looked covered. Each of those five is a fail-open opportunity:
+report "this is a guard", stop the walk, hide whatever is inside it.
+
+A check that is only ever asked the question it answers "yes" to is
+indistinguishable from one that always answers "yes". That is a property of the
+*test suite*, not of the code, and nothing in the code shows it.
+
+### Three survivors are immortal, and why that is the interesting part
+
+`rewrite_statement`'s task-5.3 re-check, `Wrapper`'s `Unresolvable` arm and
+`Wrapper::visit_write_target` cannot be killed by any test. Replacing the entire
+re-check with `if false` changes nothing observable anywhere.
+
+The shape: **`rewrite.rs`'s defensive branches are guarded by invariants
+maintained in a different function.** A reader in either file sees half the
+reason. Each now carries a note naming the upstream function, so the branch is
+not deleted as dead code and the invariant is not relaxed without the
+consequence being visible.
+
+A fault-injection seam would make the re-check testable and was **rejected**: it
+could not be `#[cfg(test)]`-only if an integration test had to reach it, so it
+would ship as a switch that disables row filtering, living inside the control it
+disables. Testing `all_policy_refs_guarded` directly tests the subject of the
+check rather than a proxy for it; what is forgone is confidence in the *wiring*
+between wrapper and net, a much narrower claim than the net's behaviour.
+
+## The recurring defect: a test double's shape bounds what can ever be tested
+
+Three times in this change, a gap was invisible from inside the tests because
+everything passed, and in each case the *shape of a stand-in* had already decided
+what could be checked:
+
+| Stand-in | What its shape excluded | What that hid |
+|---|---|---|
+| `PolicyLookup`, a two-state `Option<RowPolicy>` | the third state, `Unresolvable` | an unqualified reference with no current database was forwarded unconstrained |
+| a mock matching table names by exact equality | case- and encoding-folding | the non-ASCII identifier leak |
+| `TestPolicies::with(&[&str])` | integer permitted values | the emitter's `Integer` arm had **zero** coverage, for a configuration the README documents |
+
+The first two are the policy agent's formulation: *a mock simpler than the real
+collaborator hides exactly the class of defect the real one has.* The third
+extends it — a fixture whose **parameter types** are narrower than the
+configuration it stands in for excludes cases that no amount of care writing
+tests can recover, because the case cannot be expressed.
+
+The `is_guard` near-misses and the CTE short-circuit are the same lesson without
+a type signature involved. Every existing CTE test named its CTE `c`, which no
+policy mentions — so the lookup would have returned "unrestricted" regardless and
+the short-circuit did no work. It was present in the tests and absent from what
+they exercised. A CTE named after a policy table is the only shape where it earns
+its place.
+
+**Check what a fixture cannot express, not only what it does express.** That
+question would have found all three before mutation testing did.
