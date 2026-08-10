@@ -17,9 +17,8 @@
 //! wrapper would have missed. A test here failing means the last line of defence
 //! is gone, not that a rewrite is cosmetically different.
 
-mod rewrite_fixture;
-
-use rewrite_fixture as fixture;
+#[path = "rewrite_fixture.rs"]
+mod fixture;
 
 /// The verifier's answer for `sql` as `analyst`, failing the test if the SQL
 /// could not be analysed at all — an analysis failure would refuse the statement
@@ -104,14 +103,33 @@ fn an_unguarded_reference_beneath_a_real_guard_is_still_found() {
 }
 
 #[test]
-fn a_write_target_on_a_policy_table_is_not_guarded() {
-    // Kills `delete ! in visit_write_target`. Writes are refused earlier in
-    // `rewrite_statement`, so the verifier's own handling of a write target is
-    // otherwise unexercised — and it is what would matter if that earlier
-    // refusal were ever relaxed.
+fn an_insert_target_on_a_policy_table_is_not_guarded() {
+    // The statement that actually reaches `Verifier::visit_write_target`.
+    //
+    // Which write statement is used here is not interchangeable, and the
+    // distinction is invisible from this file. `walk_insert` hands the target
+    // to `visit_write_target` and never walks it as a relation, so an `INSERT`
+    // is the only shape whose refusal depends on that method. Writes are
+    // refused earlier in `rewrite_statement`, so this path is otherwise
+    // unexercised — and it is what would matter if that earlier refusal were
+    // ever relaxed.
+    assert!(
+        !guarded("INSERT INTO sales.orders (id, region) VALUES (1, 'AMER')"),
+        "an INSERT into a policy-bearing table must never be reported as guarded"
+    );
+}
+
+#[test]
+fn an_update_target_on_a_policy_table_is_not_guarded() {
+    // `walk_update` walks its target through `walk_table_with_joins`, so this
+    // reaches `visit_relation` rather than `visit_write_target` — a different
+    // path to the same refusal. Kept alongside the `INSERT` case because the
+    // two are easy to mistake for each other, and because a change to
+    // `walk_update` that routed the target to `visit_write_target` instead
+    // should not silently leave this shape untested.
     assert!(
         !guarded("UPDATE sales.orders SET total = 1"),
-        "a write against a policy-bearing table must never be reported as guarded"
+        "an UPDATE against a policy-bearing table must never be reported as guarded"
     );
 }
 
@@ -123,5 +141,75 @@ fn a_table_with_no_policy_for_this_user_is_guarded_vacuously() {
     assert!(
         guarded("SELECT * FROM sales.products"),
         "a statement touching no policy-bearing table has nothing to guard"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `is_guard`'s early exits
+//
+// The four near-miss tests above all fail recognition at the *final* equality
+// comparison. `is_guard` returns `false` from seven places, and each earlier one
+// is a separate opportunity for a mutant to report "this is a guard" about a
+// subquery that is not one — which stops the walk and hides whatever reference
+// is inside. These reach the earlier exits instead.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_derived_table_whose_body_is_a_set_operation_is_not_guarded() {
+    // Fails at the `SetExpr::Select` binding: a guard's body is a single
+    // `SELECT`, never a union.
+    assert!(
+        !guarded(
+            "SELECT * FROM (SELECT * FROM sales.orders UNION ALL SELECT * FROM sales.orders) AS orders"
+        ),
+        "a union inside a derived table is not a guard"
+    );
+}
+
+#[test]
+fn a_derived_table_over_two_relations_is_not_guarded() {
+    // Fails at the single-element slice pattern. Two comma-separated relations
+    // means one of them could be anything at all.
+    assert!(
+        !guarded("SELECT * FROM (SELECT * FROM sales.orders, sales.products) AS orders"),
+        "a derived table reading two relations is not a guard"
+    );
+}
+
+#[test]
+fn a_derived_table_containing_a_join_is_not_guarded() {
+    // Fails at `!joins.is_empty()`. A guard has exactly one relation and no
+    // joins; a join could widen what the subquery returns.
+    assert!(
+        !guarded(
+            "SELECT * FROM (SELECT * FROM sales.orders JOIN sales.products ON 1 = 1) AS orders"
+        ),
+        "a join inside a derived table is not a guard"
+    );
+}
+
+#[test]
+fn a_derived_table_wrapping_another_derived_table_is_not_guarded() {
+    // Fails at the `TableFactor::Table` binding: a guard wraps a named table,
+    // not another subquery.
+    assert!(
+        !guarded("SELECT * FROM (SELECT * FROM (SELECT * FROM sales.orders) AS x) AS orders"),
+        "nesting a derived table inside another is not a guard"
+    );
+}
+
+#[test]
+fn a_derived_table_whose_relation_is_aliased_is_not_guarded() {
+    // Fails at `alias.is_some()`. A real guard strips the alias off the inner
+    // relation and puts it on the wrapper, so an alias surviving inside means
+    // this subquery was not built by `guard`.
+    //
+    // This exit is load-bearing in a way the others are not: it sits *before*
+    // the whole-query equality comparison, so a mutant that returns `true` here
+    // accepts the subquery without ever checking its predicate. The statement
+    // below has no predicate at all, and would be waved through.
+    assert!(
+        !guarded("SELECT * FROM (SELECT * FROM sales.orders o) AS orders"),
+        "an alias on the inner relation means this is not the guard we built"
     );
 }

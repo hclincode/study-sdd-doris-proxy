@@ -615,3 +615,48 @@ fn an_unaliased_projection_subquery_changes_its_generated_column_label() {
         "an explicit alias must be preserved exactly: {forwarded}"
     );
 }
+
+/// Integer permitted values are emitted as bare numbers, not quoted strings.
+///
+/// `permitted_values = [17, 23]` is documented configuration, and the emitter
+/// has a separate arm for it — but every other test in this suite uses text
+/// values, so that arm was reached by no test at all. Quoting an integer would
+/// hand Doris `tenant_id IN ('17')`, which either fails or matches by implicit
+/// coercion depending on the column type; neither is the configured policy.
+#[test]
+fn integer_permitted_values_are_emitted_as_numeric_literals() {
+    let policies = fixture::TestPolicies::for_user("analyst").with_integers(
+        "sales",
+        "invoices",
+        "tenant_id",
+        &[17, 23],
+    );
+    assert_eq!(
+        policies.rewrite("SELECT * FROM sales.invoices").unwrap(),
+        "SELECT * FROM (SELECT * FROM sales.invoices WHERE `tenant_id` IN (17, 23)) AS invoices"
+    );
+}
+
+/// A common table expression whose name collides with a policy table is still a
+/// CTE, not the table.
+///
+/// The rewriter short-circuits policy lookup for a CTE reference. Every other
+/// CTE test names the CTE something no policy mentions, so the short-circuit was
+/// never load-bearing: the lookup would have returned "unrestricted" anyway. A
+/// colliding name is the case where it does the work — the CTE body is
+/// constrained at its own site, and the *use* of the CTE must be left alone
+/// rather than wrapped as though it were the table.
+#[test]
+fn a_cte_named_after_a_policy_table_is_not_treated_as_the_table() {
+    let forwarded =
+        assert_fully_guarded("WITH orders AS (SELECT * FROM sales.orders) SELECT * FROM orders");
+    assert_eq!(
+        forwarded,
+        format!("WITH orders AS (SELECT * FROM {ORDERS_GUARD} AS orders) SELECT * FROM orders")
+    );
+    assert_eq!(
+        guard_count(&forwarded),
+        1,
+        "the CTE's use site must not be wrapped a second time: {forwarded}"
+    );
+}

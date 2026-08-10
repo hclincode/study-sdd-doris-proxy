@@ -661,6 +661,22 @@ fn walk_select_item<V: SiteVisitor>(
         SelectItem::ExprWithAlias { expr, .. } => walk_expr(expr, scope, v),
         SelectItem::ExprWithAliases { .. } => unsupported("multi-alias select item"),
         SelectItem::QualifiedWildcard(_, options) | SelectItem::Wildcard(options) => {
+            // Unreachable through `MySqlDialect`, and kept deliberately.
+            //
+            // Every one of these six options is parsed only behind a dialect
+            // predicate — `supports_select_wildcard_ilike`, `_exclude`,
+            // `_except`, `_replace`, `_rename`, `_with_alias`
+            // (`sqlparser-0.62.0/src/parser/mod.rs:18593-18620`). All six
+            // default to `false` in `dialect/mod.rs`, and `dialect/mysql.rs`
+            // overrides none of them, so the parser never even attempts the
+            // syntax and the fields are structurally always `None`.
+            //
+            // Mutation testing therefore cannot kill mutants of this guard, and
+            // no test can either. **That is not a reason to delete it.** It is
+            // the D3 allowlist doing its job: if a later `sqlparser` turns one
+            // of those predicates on for MySQL, a wildcard modifier would start
+            // reaching the walk, and without this guard it would be accepted
+            // silently rather than refused.
             if options.opt_ilike.is_some()
                 || options.opt_exclude.is_some()
                 || options.opt_except.is_some()
@@ -882,6 +898,15 @@ fn walk_limit_clause<V: SiteVisitor>(
             offset,
             limit_by,
         } => {
+            // Unreachable through `MySqlDialect`, and kept deliberately.
+            //
+            // `LIMIT n BY expr` is ClickHouse syntax, parsed only when
+            // `supports_limit_by()` is true (`parser/mod.rs:13089`). It defaults
+            // to `false` in `dialect/mod.rs:1672` and is overridden only in
+            // `clickhouse.rs` and `generic.rs`, so under this dialect the
+            // parser stops before the `BY` keyword and `limit_by` is always
+            // empty. No test can reach this guard; it is D3 cover against a
+            // future dialect change, not dead code.
             if !limit_by.is_empty() {
                 return unsupported("LIMIT BY clause");
             }
@@ -1163,6 +1188,21 @@ fn walk_insert<V: SiteVisitor>(
     if insert.format_clause.is_some() {
         return unsupported("FORMAT clause");
     }
+    // Unreachable through *any* dialect in `sqlparser` 0.62, and kept
+    // deliberately.
+    //
+    // Stronger than the usual "not under MySQL" argument: all four fields are
+    // assigned in exactly one place in the entire parser
+    // (`parser/mod.rs:18069-18072`), and that assignment sets every one of them
+    // to `None`/empty. There is no parse path for Snowflake's `INSERT ALL` /
+    // `INSERT FIRST` at all — the AST models the construct, the parser does not
+    // yet build it. So no input reaches this guard and no test can kill a mutant
+    // of it.
+    //
+    // It stays because the day `sqlparser` learns that syntax, a multi-table
+    // INSERT would arrive carrying several write targets that `walk_insert`
+    // enumerates only one of — exactly the incomplete enumeration invariant 6
+    // forbids.
     if insert.multi_table_insert_type.is_some()
         || !insert.multi_table_into_clauses.is_empty()
         || !insert.multi_table_when_clauses.is_empty()
@@ -1273,5 +1313,138 @@ pub(crate) fn same_quoting(model: &Ident, value: &str) -> Ident {
     match model.quote_style {
         Some(quote) => Ident::with_quote(quote, value),
         None => Ident::new(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_executable_comment;
+
+    /// The executable-comment scanner's decision surface, exercised directly.
+    ///
+    /// The end-to-end tests in `tests/analyze_walk.rs` pin the *verdict* for a
+    /// handful of statements, which leaves almost every internal transition of
+    /// this state machine free to be wrong without a test noticing — mutation
+    /// testing found 22 surviving mutants in it, including one deleting the `#`
+    /// line-comment arm outright. A scanner that decides refusal deserves to be
+    /// tested as a scanner.
+    ///
+    /// Each row is `(input, contains_marker)`. The interesting rows are the ones
+    /// where a marker is *present in the text* but inert because of where it
+    /// sits, and the mirrored ones where the same marker is live.
+    #[test]
+    fn executable_comment_scanner_decision_surface() {
+        const CASES: &[(&str, bool)] = &[
+            // -- nothing to find -------------------------------------------
+            ("", false),
+            ("   ", false),
+            ("SELECT 1", false),
+            ("SELECT * FROM sales.orders", false),
+            // -- the marker itself, at each position in the input ----------
+            ("/*!", true),
+            ("/*!50000 SELECT 1 */", true),
+            ("SELECT 1 /*!", true),
+            ("/*! */ SELECT 1", true),
+            ("SELECT 1 /*!99999 UNION SELECT 2 */", true),
+            // A lone `/*` is an ordinary comment; only `!` makes it a gate.
+            ("SELECT 1 /* */", false),
+            ("SELECT 1 /*", false),
+            ("SELECT /*+ hint */ 1", false),
+            // -- `#` line comments -----------------------------------------
+            ("SELECT 1 # /*! inert */", false),
+            ("SELECT 1 # inert\n", false),
+            ("# /*! inert */", false),
+            // ...but the comment ends at the newline.
+            ("SELECT 1 # inert\n/*! live */", true),
+            ("#\n/*!", true),
+            // -- `--` line comments ----------------------------------------
+            ("SELECT 1 -- /*! inert */", false),
+            ("SELECT 1 --\n", false),
+            ("SELECT 1 --", false),
+            ("SELECT 1 -- inert\n/*! live */", true),
+            // `--` needs whitespace after it to be a comment; `1--2` is
+            // arithmetic, so the marker after it is live.
+            ("SELECT 1--2 /*! live */", true),
+            ("SELECT 1-2 /*! live */", true),
+            ("SELECT 1 - -2 /*! live */", true),
+            // -- `/* */` block comments ------------------------------------
+            ("SELECT /* inert /*! */ 1", false),
+            ("SELECT /* inert */ 1", false),
+            // Block comments do not nest in MySQL: the first `*/` ends it, so a
+            // marker after that `*/` is live even though it looks nested.
+            ("SELECT /* a /*! */ */ 1", false),
+            ("SELECT /* a */ /*! live */ 1", true),
+            ("SELECT /* a */ 1 /*! live */", true),
+            // A `/` inside a block comment must not be mistaken for its end.
+            ("SELECT /* a/b /*! inert */ 1", false),
+            ("SELECT /* a/b */ /*! live */ 1", true),
+            // A `*` inside a block comment must not end it either.
+            ("SELECT /* a*b /*! inert */ 1", false),
+            // An unterminated block comment swallows the rest of the input.
+            ("SELECT /* unterminated /*! inert", false),
+            // -- string literals and quoted identifiers --------------------
+            ("SELECT '/*! inert */'", false),
+            ("SELECT \"/*! inert */\"", false),
+            ("SELECT `/*! inert */`", false),
+            ("SELECT '/*!' , '/*!'", false),
+            // ...and a marker after the literal closes is live.
+            ("SELECT '/*! inert */' /*! live */", true),
+            ("SELECT \"x\" /*! live */", true),
+            ("SELECT `x` /*! live */", true),
+            // Doubled delimiters are literal and do not close the string, so
+            // the marker stays inside it.
+            ("SELECT 'it''s /*! inert */'", false),
+            ("SELECT \"say \"\"hi\"\" /*! inert */\"", false),
+            ("SELECT `a``b /*! inert */`", false),
+            // ...but the string does eventually close.
+            ("SELECT 'it''s' /*! live */", true),
+            ("SELECT 'a''' /*! live */", true),
+            ("SELECT `a``b` /*! live */", true),
+            // An unterminated literal swallows the rest of the input.
+            ("SELECT 'unterminated /*! inert", false),
+            // One quote kind does not close another.
+            ("SELECT 'a \" b' /*! live */", true),
+            ("SELECT \"a ' b\" /*! live */", true),
+            // A comment marker inside a string does not start a comment, so the
+            // later marker is still live.
+            ("SELECT '-- not a comment' /*! live */", true),
+            ("SELECT '# not a comment' /*! live */", true),
+            ("SELECT '/* not a comment' /*! live */", true),
+            // Conversely a quote inside a comment does not open a string.
+            ("SELECT 1 -- it's fine\n/*! live */", true),
+            ("SELECT 1 /* it's fine */ /*! live */", true),
+            ("SELECT 1 # it's fine\n/*! live */", true),
+        ];
+
+        for (input, expected) in CASES {
+            assert_eq!(
+                contains_executable_comment(input),
+                *expected,
+                "scanner disagreed on {input:?}"
+            );
+        }
+    }
+
+    /// The scanner must terminate and must not panic on any input, including
+    /// the truncated and adversarial shapes a client can send. It runs on
+    /// attacker-controlled bytes, so invariant 2 applies to it directly.
+    #[test]
+    fn executable_comment_scanner_never_panics_on_partial_input() {
+        // Every prefix of a statement that mixes all the delimiters, which
+        // between them reach every state with a truncated tail.
+        let sql = "SELECT 'a''b', \"c\"\"d\", `e``f` /* g/h */ -- i\n# j\n/*!99999 k */";
+        for end in 0..=sql.len() {
+            if sql.is_char_boundary(end) {
+                let _ = contains_executable_comment(&sql[..end]);
+            }
+        }
+
+        // Delimiters with nothing after them.
+        for input in [
+            "'", "\"", "`", "/", "/*", "/*!", "-", "--", "#", "*", "*/", "''", "``", "\"\"", "/*/",
+            "/**", "--\n", "#\n",
+        ] {
+            let _ = contains_executable_comment(input);
+        }
     }
 }

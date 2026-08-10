@@ -44,6 +44,10 @@ struct Row {
     table: String,
     column: String,
     values: Vec<String>,
+    /// Whether the values are rendered as TOML strings. Integers must reach the
+    /// loader as bare numbers or they arrive as text and the integer path is
+    /// never exercised.
+    quoted: bool,
 }
 
 /// A validated policy set plus the session state a lookup needs: which user is
@@ -91,6 +95,7 @@ impl TestPolicies {
             table: table.to_string(),
             column: column.to_string(),
             values: values.iter().map(|v| (*v).to_string()).collect(),
+            quoted: true,
         };
         match self
             .rows
@@ -100,6 +105,29 @@ impl TestPolicies {
             Some(existing) => *existing = row,
             None => self.rows.push(row),
         }
+        self.rebuild()
+    }
+
+    /// Add a policy whose permitted values are integers.
+    ///
+    /// The text and integer arms of the emitter are separate code paths, and
+    /// `permitted_values = [17, 23]` is a documented configuration — so the
+    /// integer path needs a fixture of its own rather than being assumed to
+    /// behave like the text one.
+    pub fn with_integers(
+        mut self,
+        database: &str,
+        table: &str,
+        column: &str,
+        values: &[i64],
+    ) -> Self {
+        self.rows.push(Row {
+            database: database.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            quoted: false,
+        });
         self.rebuild()
     }
 
@@ -125,7 +153,11 @@ impl TestPolicies {
             source.push_str(&format!("database = {}\n", toml_string(&row.database)));
             source.push_str(&format!("table = {}\n", toml_string(&row.table)));
             source.push_str(&format!("column = {}\n", toml_string(&row.column)));
-            let values: Vec<String> = row.values.iter().map(|v| toml_string(v)).collect();
+            let values: Vec<String> = if row.quoted {
+                row.values.iter().map(|v| toml_string(v)).collect()
+            } else {
+                row.values.clone()
+            };
             source.push_str(&format!("permitted_values = [{}]\n\n", values.join(", ")));
         }
         self.policies = PolicySet::from_toml_str(&source, "rewrite_fixture.rs")

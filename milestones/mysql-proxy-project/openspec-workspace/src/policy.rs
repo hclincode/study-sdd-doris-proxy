@@ -148,13 +148,10 @@ impl QualifiedTable {
         }
     }
 
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    pub fn table(&self) -> &str {
-        &self.table
-    }
+    // No `database()` / `table()` part accessors: nothing needs the parts
+    // separately, and mutation testing found them untested because they are
+    // uncalled. `Display` renders `database.table`, which is what every
+    // consumer actually wants. Add them back with a test if a caller appears.
 }
 
 impl fmt::Display for QualifiedTable {
@@ -219,14 +216,11 @@ impl TableRef {
     }
 }
 
-impl fmt::Display for TableRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.database {
-            Some(database) => write!(f, "{}.{}", database, self.table),
-            None => write!(f, "{}", self.table),
-        }
-    }
-}
+// No `Display` for `TableRef`: nothing formats one. It existed for diagnostics
+// that were never written, and mutation testing found it unobserved — a `fmt`
+// that wrote nothing at all passed the whole suite. A refusal message must not
+// echo a user's SQL back anyway (design D5), so the most likely future caller
+// is one that should not exist.
 
 /// A permitted column value, emitted into the injected predicate as a literal.
 ///
@@ -264,17 +258,16 @@ impl fmt::Display for PermittedValue {
 /// whose `column` is in `permitted_values`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
-    user: String,
+    // No `user` field: a policy is already stored under its username in
+    // `PolicySet::by_user`, so carrying it here duplicated the map key and the
+    // copy was never read. Mutation testing found the accessor untested because
+    // nothing called it.
     table: QualifiedTable,
     column: String,
     permitted_values: Vec<PermittedValue>,
 }
 
 impl Policy {
-    pub fn user(&self) -> &str {
-        &self.user
-    }
-
     pub fn table(&self) -> &QualifiedTable {
         &self.table
     }
@@ -325,6 +318,23 @@ impl PolicyDecision<'_> {
         matches!(self, PolicyDecision::Restricted(_))
     }
 
+    /// Whether the reference could not be resolved to a table at all.
+    ///
+    /// # Why this exists with no production caller
+    ///
+    /// It was deleted once as dead API — nothing called it, so both `-> true`
+    /// and `-> false` mutants survived — and restored deliberately. The triad
+    /// is load-bearing as *shape*: an API offering only "restricted" and
+    /// "unrestricted" teaches the next caller that there are two states, and
+    /// the two-state reading of a three-state decision is the defect this
+    /// project exists to avoid. It forces `!is_unrestricted()` as the only way
+    /// to ask about the third case, which conflates `Restricted` with
+    /// `Unresolvable` — correct for the rewriter's verifier, which wants both
+    /// treated as unguarded, and a live bypass anywhere that must tell them
+    /// apart.
+    ///
+    /// Pinned by `the_decision_predicates_answer_correctly_for_every_state`, so
+    /// it is not itself an untested helper.
     pub fn is_unresolvable(&self) -> bool {
         matches!(self, PolicyDecision::Unresolvable)
     }
@@ -399,7 +409,6 @@ impl PolicySet {
                 .collect::<Result<Vec<_>>>()?;
 
             let policy = Policy {
-                user: user.to_string(),
                 table: QualifiedTable::new(database, table),
                 column: column.to_string(),
                 permitted_values,
@@ -1597,6 +1606,10 @@ mod tests {
             "#,
         );
         assert!(message.contains("duplicate policy"), "{message}");
+        // The message names the colliding table through `QualifiedTable`'s
+        // `Display`, and nothing asserted that until now — the operator needs
+        // to know *which* table collided, not merely that one did.
+        assert!(message.contains("sales.orders"), "{message}");
     }
 
     #[test]
@@ -1658,6 +1671,37 @@ mod tests {
                 PermittedValue::Integer(42)
             ]
         );
+    }
+
+    #[test]
+    fn the_decision_predicates_answer_correctly_for_every_state() {
+        // `is_restricted` and `is_unrestricted` are the assertion helpers a
+        // dozen tests in this file lean on. Nothing asserted their *negative*
+        // answers, so `replace is_restricted -> bool with true` survived the
+        // whole suite — and with it, every one of those assertions would have
+        // passed vacuously. This pins all three states against both predicates.
+        let policies = analyst_orders();
+
+        // Every predicate against every state — a 3x3 grid rather than the
+        // positive answer of each, which is how the hole above opened.
+        let restricted = policies.lookup("analyst", &TableRef::qualified("sales", "orders"), None);
+        assert!(restricted.is_restricted());
+        assert!(!restricted.is_unrestricted());
+        assert!(!restricted.is_unresolvable());
+
+        let unrestricted =
+            policies.lookup("analyst", &TableRef::qualified("sales", "products"), None);
+        assert!(!unrestricted.is_restricted());
+        assert!(unrestricted.is_unrestricted());
+        assert!(!unrestricted.is_unresolvable());
+
+        let unresolvable = policies.lookup("analyst", &TableRef::unqualified("orders"), None);
+        assert!(!unresolvable.is_restricted());
+        assert!(
+            !unresolvable.is_unrestricted(),
+            "an unresolvable reference must never read as unrestricted"
+        );
+        assert!(unresolvable.is_unresolvable());
     }
 
     #[test]
