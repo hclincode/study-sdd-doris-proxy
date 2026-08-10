@@ -256,6 +256,16 @@ pub fn parse_single(sql: &str) -> AnalysisResult<Statement> {
 ///   which is MySQL's own rule. Treating it as a comment unconditionally would
 ///   skip the rest of the line in `SELECT 1--2 /*!99999 ... */` and miss the
 ///   marker.
+///
+/// # Termination
+///
+/// Every branch advances `i`, which is what makes the loop terminate on
+/// arbitrary input — and this function runs on attacker-controlled bytes before
+/// anything has validated them, so invariant 2 covers a hang as much as a panic.
+/// The property is easy to break silently: a cursor that moved *backwards* on
+/// leaving a block comment loops forever on `/*/**/`, because it re-enters the
+/// comment it just left. Mutation testing produced exactly that, and
+/// `SELECT 1 /*/**/` in the decision-surface table is what catches it.
 fn contains_executable_comment(sql: &str) -> bool {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
@@ -631,11 +641,20 @@ fn walk_select<V: SiteVisitor>(
         walk_expr(selection, scope, v)?;
     }
     match &mut select.group_by {
-        GroupByExpr::All(modifiers) => {
-            if !modifiers.is_empty() {
-                return unsupported("GROUP BY ALL modifier");
-            }
-        }
+        // Refused outright, not for what it does but for what it *is*.
+        //
+        // `sqlparser` reads `GROUP BY ALL` as this dedicated node. MySQL reads
+        // `ALL` as a reserved word and rejects the statement, and Doris follows
+        // MySQL. So the parser and the backend disagree about what the text even
+        // is — the parser differential in its purest form, and the one risk D3's
+        // allowlist exists to keep narrow.
+        //
+        // Refusing is free: Doris rejects these statements anyway, so nothing
+        // that works today stops working, and the client gets a clearer error
+        // from the proxy than it would from the backend. Accepting a shape whose
+        // parse is known not to match the backend's is the thing worth avoiding,
+        // whether or not this particular one can be turned into a leak.
+        GroupByExpr::All(_) => return unsupported("GROUP BY ALL"),
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return unsupported("GROUP BY modifier");
@@ -1387,6 +1406,19 @@ mod tests {
             ("SELECT /* a*b /*! inert */ 1", false),
             // An unterminated block comment swallows the rest of the input.
             ("SELECT /* unterminated /*! inert", false),
+            // The cursor must resume *after* the closing `*/`, not before it.
+            //
+            // These pin that specifically, because nothing else does. Both put a
+            // delimiter in the last two bytes of the comment body, which is
+            // exactly the window a cursor that resumed too early would re-read
+            // in `Normal` state: the quote would open a string that swallows the
+            // live marker following the comment, and the `/*` would re-enter the
+            // comment it just left and never terminate.
+            ("SELECT /* x' */ /*! live */", true),
+            ("SELECT /* x\" */ /*! live */", true),
+            ("SELECT /* x` */ /*! live */", true),
+            ("SELECT 1 /*/**/", false),
+            ("SELECT 1 /*/**/ /*! live */", true),
             // -- string literals and quoted identifiers --------------------
             ("SELECT '/*! inert */'", false),
             ("SELECT \"/*! inert */\"", false),

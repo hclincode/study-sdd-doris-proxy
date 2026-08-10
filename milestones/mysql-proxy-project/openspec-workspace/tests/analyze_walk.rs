@@ -510,34 +510,26 @@ fn a_mysql_select_modifier_is_refused() {
     }
 }
 
-/// `GROUP BY ALL` parses under `MySqlDialect` into `GroupByExpr::All`, and the
-/// walk currently accepts it — it introduces no table reference, and it round-
-/// trips through rendering unchanged.
+/// `GROUP BY ALL` is refused, because `sqlparser` and the backend disagree about
+/// what the text is rather than about what it does.
 ///
-/// Pinned so the behaviour is deliberate rather than accidental. Found by
-/// mutation testing: inverting the guard in that arm turns acceptance into
-/// refusal, and nothing exercised `GROUP BY ALL` either way.
+/// `MySqlDialect` parses it into a dedicated `GroupByExpr::All` node. MySQL
+/// treats `ALL` as a reserved word and rejects the statement, and Doris follows
+/// MySQL. Refusing costs nothing that works today — Doris would reject it
+/// anyway — and it keeps the allowlist from accepting a shape whose parse is
+/// known not to match the backend's, which is the parser differential D3 exists
+/// to keep narrow.
 ///
-/// The guard it sits behind — `GROUP BY ALL <modifier>` — is unreachable through
-/// this dialect: `MySqlDialect` does not parse `WITH ROLLUP` at all, not even in
-/// the plain `GROUP BY a WITH ROLLUP` form that is ordinary MySQL. So the arm is
-/// reachable but its modifier check is not.
-///
-/// Worth a decision rather than a test alone. `ALL` is reserved in MySQL, so
-/// Doris rejects `GROUP BY ALL` outright — `sqlparser` and the backend disagree
-/// about what this statement is. Refusing it would suit the allowlist better and
-/// would cost nothing that works today.
+/// Found by mutation testing, which showed nothing exercised `GROUP BY ALL` in
+/// either direction.
 #[test]
-fn group_by_all_is_accepted() {
-    let analysis = analyze("SELECT region FROM sales.orders GROUP BY ALL").unwrap();
-    assert_eq!(
-        analysis
-            .tables
-            .iter()
-            .map(|t| t.name.to_string())
-            .collect::<Vec<_>>(),
-        ["sales.orders"]
-    );
+fn group_by_all_is_refused() {
+    let RefusalReason::UnsupportedShape { construct } =
+        refusal("SELECT region FROM sales.orders GROUP BY ALL")
+    else {
+        panic!("GROUP BY ALL should refuse as an unsupported shape");
+    };
+    assert_eq!(construct, "GROUP BY ALL");
 }
 
 /// `WITH ROLLUP` is ordinary MySQL and `sqlparser`'s `MySqlDialect` cannot parse
