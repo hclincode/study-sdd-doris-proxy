@@ -32,14 +32,14 @@
 //! # How permitted values reach the backend
 //!
 //! The rewriter maps [`PermittedValue`] onto a `sqlparser` `Value` node and
-//! lets `sqlparser`'s renderer emit the literal.
-//! [`PermittedValue::to_sql_literal`] is **not** on that path — it is for
-//! diagnostics and tests, and double-escapes if used to build AST literals.
+//! lets `sqlparser`'s renderer emit the literal. **Nothing in this module
+//! renders SQL** — [`PermittedValue`]'s `Display` is the value as written, with
+//! no quoting — so there is no second escaping path here to disagree with the
+//! renderer.
 //!
-//! `sqlparser`'s renderer is not equivalent to `to_sql_literal`, and the
-//! difference matters for task 8.6. It doubles an isolated `'`, but it does
-//! **not** escape backslashes, and it deliberately leaves alone any `'` it
-//! judges already-escaped. Pinned by `tests/policy_value_rendering.rs`:
+//! What that renderer does matters for task 8.6. It doubles an isolated `'`,
+//! but it does **not** escape backslashes, and it deliberately leaves alone any
+//! `'` it judges already-escaped. Pinned by `tests/policy_value_rendering.rs`:
 //!
 //! | configured value | rendered | MySQL reads (default `sql_mode`) |
 //! |---|---|---|
@@ -49,9 +49,7 @@
 //! | `a\` | `'a\'` | literal never terminates — **statement corrupted** |
 //!
 //! Rows 2 and 3 can *widen* the permitted set if some row happens to hold the
-//! transformed value, and row 4 changes the shape of the injected predicate. So
-//! the fail-closed reasoning that holds for `to_sql_literal` does not carry over
-//! to the real output path.
+//! transformed value, and row 4 changes the shape of the injected predicate.
 //!
 //! **Closed at load time.** Rather than depend on the backend's escaping mode,
 //! a permitted value containing a backslash, a `''` sequence, or a NUL is
@@ -110,6 +108,17 @@
 //! confidentiality. Two policies for one user whose table names collide under
 //! that comparison are a configuration error. Usernames are compared exactly,
 //! matching MySQL's case-sensitive account names.
+//!
+//! **That argument holds only while identifiers are ASCII, so they are required
+//! to be.** `database`, `table` and `column` are refused at load if they contain
+//! any non-ASCII character. `to_ascii_lowercase` leaves such characters alone,
+//! which would make one name match case-insensitively in its ASCII part and
+//! case-sensitively in the rest — flipping the failure direction from
+//! over-applying to **under**-applying, and an under-applied policy is a
+//! disclosure. This was a real leak, not a hypothetical: a policy on
+//! `sales.ordres_é` forwarded a query for `sales.ordres_É` with no predicate and
+//! no refusal. See `required_ascii_identifier` for why `to_lowercase()` is not
+//! the fix.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -122,8 +131,9 @@ use crate::error::{ProxyError, Result};
 
 /// A table named by database and table, as written in the configuration.
 ///
-/// The spelling is preserved for diagnostics; matching goes through the
-/// normalised [`TableKey`].
+/// The spelling is preserved for diagnostics; matching goes through a
+/// normalised key private to this module, so a policy cannot be matched by
+/// anything a caller constructs by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualifiedTable {
     database: String,
@@ -228,53 +238,25 @@ pub enum PermittedValue {
     Integer(i64),
 }
 
-impl PermittedValue {
-    /// The value as a MySQL literal — **for diagnostics and tests only**.
-    ///
-    /// # Do not use this to build the rewritten statement
-    ///
-    /// The return value is *already quoted and escaped*. The rewriter maps
-    /// [`PermittedValue`] variants onto `sqlparser` `Value` nodes and lets
-    /// `sqlparser`'s renderer do the quoting; feeding this string into a
-    /// `Value::SingleQuotedString` would escape it a second time, so the
-    /// injected predicate would compare against a literal that is not the
-    /// configured value. The method looks exactly like the thing to reach for,
-    /// which is why this warning is here rather than in a design document.
-    ///
-    /// # Escaping, for the purpose that remains
-    ///
-    /// A single quote is doubled and a backslash is doubled. That is correct
-    /// under MySQL's default `sql_mode`; under `NO_BACKSLASH_ESCAPES` the
-    /// doubled backslash matches nothing, which narrows the permitted set
-    /// rather than widening it.
-    ///
-    /// **That narrowing argument covers this method only.** It does not
-    /// describe the SQL the proxy actually forwards — see the module-level
-    /// "How permitted values reach the backend" for what `sqlparser`'s renderer
-    /// does, which is materially different and not narrowing-safe.
-    pub fn to_sql_literal(&self) -> String {
-        match self {
-            PermittedValue::Integer(value) => value.to_string(),
-            PermittedValue::Text(value) => {
-                let mut out = String::with_capacity(value.len() + 2);
-                out.push('\'');
-                for ch in value.chars() {
-                    match ch {
-                        '\'' => out.push_str("''"),
-                        '\\' => out.push_str("\\\\"),
-                        _ => out.push(ch),
-                    }
-                }
-                out.push('\'');
-                out
-            }
-        }
-    }
-}
-
+/// The value as written, for diagnostics and log lines.
+///
+/// **Deliberately not a SQL literal**: no quoting, no escaping, no delimiters.
+/// Turning a configured value into SQL is the rewriter's job — it maps
+/// [`PermittedValue`] variants onto `sqlparser` `Value` nodes and lets the
+/// renderer quote them. Nothing in this module renders SQL, so nothing here can
+/// be mistaken for the emitter and quietly become a second escaping path that
+/// disagrees with the first.
+///
+/// This type once carried a `to_sql_literal` for that purpose. It was removed:
+/// it escaped differently from the renderer, so using it to build an AST literal
+/// would have double-escaped, and a plausible-looking method on the policy type
+/// is exactly what someone reaches for.
 impl fmt::Display for PermittedValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_sql_literal())
+        match self {
+            PermittedValue::Text(value) => f.write_str(value),
+            PermittedValue::Integer(value) => write!(f, "{value}"),
+        }
     }
 }
 
@@ -354,6 +336,7 @@ impl PolicyDecision<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct PolicySet {
     by_user: HashMap<String, HashMap<TableKey, Policy>>,
+    advisories: Vec<String>,
 }
 
 impl PolicySet {
@@ -389,10 +372,14 @@ impl PolicySet {
         for (index, entry) in raw.policy.iter().enumerate() {
             let label = format!("{origin}: {}", entry.describe(index));
 
+            // `user` is compared byte-for-byte and never folded, so it has no
+            // folding asymmetry to protect against. The other three are folded
+            // for matching or emitted into SQL — see `required_ascii_identifier`.
             let user = required_identifier(entry.user.as_deref(), "user", &label)?;
-            let database = required_identifier(entry.database.as_deref(), "database", &label)?;
-            let table = required_identifier(entry.table.as_deref(), "table", &label)?;
-            let column = required_identifier(entry.column.as_deref(), "column", &label)?;
+            let database =
+                required_ascii_identifier(entry.database.as_deref(), "database", &label)?;
+            let table = required_ascii_identifier(entry.table.as_deref(), "table", &label)?;
+            let column = required_ascii_identifier(entry.column.as_deref(), "column", &label)?;
 
             let Some(raw_values) = entry.permitted_values.as_deref() else {
                 return Err(ProxyError::Config(format!(
@@ -435,7 +422,17 @@ impl PolicySet {
             }
         }
 
-        Ok(Self { by_user })
+        let advisories = username_advisories(&raw, origin);
+        for advisory in &advisories {
+            // Emitted here rather than left to the caller, so an operator sees
+            // it without `main.rs` having to remember to ask.
+            tracing::warn!("{advisory}");
+        }
+
+        Ok(Self {
+            by_user,
+            advisories,
+        })
     }
 
     /// Whether this user has any policy at all.
@@ -444,6 +441,14 @@ impl PolicySet {
     /// not parse: a user with no policies has nothing to protect (design D6).
     pub fn has_any_policy(&self, user: &str) -> bool {
         self.by_user.contains_key(user)
+    }
+
+    /// Non-fatal warnings raised while loading, already emitted via `tracing`.
+    ///
+    /// Exposed so they can be asserted on directly: a warning that only exists
+    /// as log output is a warning nothing tests.
+    pub fn advisories(&self) -> &[String] {
+        &self.advisories
     }
 
     /// How many policies were loaded. For startup logging and tests.
@@ -635,6 +640,110 @@ fn required_identifier<'a>(value: Option<&'a str>, field: &str, label: &str) -> 
             "{label}: field `{field}` has leading or trailing whitespace"
         )));
     }
+    Ok(value)
+}
+
+/// Warn about usernames that could have been written more than one way.
+///
+/// # Why this is a warning and not a rule
+///
+/// A username is compared byte-for-byte and never folded or normalised, and
+/// that is correct: Doris compares account names as byte strings, and no MySQL
+/// collation performs Unicode normalisation. So NFC `josé` and NFD `josé` are
+/// two genuinely *different* Doris accounts that render identically. Folding
+/// them together would apply one account's policy to another — the same
+/// disclosure shape as the ASCII-folding leak, pointing the other way.
+///
+/// Rejecting them is also wrong: an operator with a legitimately non-ASCII
+/// account could then express no policy for that user at all, leaving them
+/// unrestricted — the same disclosure again, by way of a proxy that will not
+/// start.
+///
+/// So the matching is right and the hazard is in *authoring*: two byte
+/// sequences no editor will distinguish. Detection is the only mitigation that
+/// does not introduce a worse bug, and it is useless without the code points,
+/// because seeing the two forms side by side is precisely what is impossible.
+fn username_advisories(raw: &RawFile, origin: &str) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut advisories = Vec::new();
+
+    for entry in &raw.policy {
+        let Some(user) = entry.user.as_deref() else {
+            continue;
+        };
+        if user.is_ascii() || seen.contains(&user) {
+            continue;
+        }
+        seen.push(user);
+
+        advisories.push(format!(
+            "{origin}: user {user:?} ({}) contains non-ASCII characters. Doris compares account \
+             names byte-for-byte and no MySQL collation applies Unicode normalisation, so a \
+             username that renders identically in a different encoding is a DIFFERENT account, \
+             not another spelling of this one. If these code points do not byte-match the \
+             account Doris authenticates, this policy applies to nobody and that user is \
+             unrestricted — compare them against the account the backend holds",
+            code_points(user)
+        ));
+    }
+
+    advisories
+}
+
+/// `josé` -> `U+006A U+006F U+0073 U+00E9`. The whole point of the advisory:
+/// the two encodings are indistinguishable until spelled out this way.
+fn code_points(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| format!("U+{:04X}", ch as u32))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An identifier that will be **case-folded** for matching, or emitted into SQL:
+/// `database`, `table`, `column`. Must additionally be ASCII.
+///
+/// # Why ASCII-only, and why `to_lowercase()` is not the fix
+///
+/// Matching folds with `to_ascii_lowercase`, which leaves every non-ASCII
+/// character untouched. That makes matching case-*insensitive* for the ASCII
+/// part of a name and case-*sensitive* for the rest — so a policy on
+/// `sales.ordres_é` did not match a query for `sales.ordres_É`, and the
+/// reference was forwarded with no predicate and no refusal. An over-applied
+/// policy costs function; an under-applied one is a disclosure. The asymmetry
+/// was the defect, not the folding.
+///
+/// Swapping in `str::to_lowercase` moves the boundary rather than removing it.
+/// Unicode simple lowercasing is not MySQL's collation-based folding either —
+/// dotless `ı` under a Turkish collation, final sigma, and other locale-
+/// dependent cases still disagree — so it would restore a rule that is correct
+/// under some backend settings and silently wrong under others. That is the
+/// shape this project has already rejected twice for permitted values.
+///
+/// Refusing at load is correct under **every** backend identifier-folding
+/// setting, because the identifier never participates in a comparison at all.
+/// Supporting non-ASCII names honestly means reading the backend's
+/// `lower_case_table_names` and collation at startup and folding the way it
+/// does — a feature, not a one-line change.
+fn required_ascii_identifier<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    label: &str,
+) -> Result<&'a str> {
+    let value = required_identifier(value, field, label)?;
+
+    if let Some(offender) = value.chars().find(|ch| !ch.is_ascii()) {
+        return Err(ProxyError::Config(format!(
+            "{label}: field `{field}` ({value:?}) contains the non-ASCII character {offender:?}. \
+             Policy matching folds ASCII case only, so this name would match case-sensitively \
+             where the rest of it matches case-insensitively, and a policy that silently fails to \
+             match is a disclosure rather than an inconvenience. Refusing is correct under every \
+             backend identifier-folding setting. Before reaching for Unicode lowercasing, read the \
+             note on `required_ascii_identifier` in src/policy.rs: it is not MySQL's collation \
+             folding either"
+        )));
+    }
+
     Ok(value)
 }
 
@@ -910,6 +1019,216 @@ mod tests {
         assert!(policies
             .lookup("analyst", &TableRef::qualified("SALES", "Orders"), None)
             .is_restricted());
+    }
+
+    #[test]
+    fn ascii_case_folding_still_applies_after_the_non_ascii_rule() {
+        // Pinned so that nobody "fixes" the non-ASCII leak by removing the
+        // folding: dropping it would let `SALES.ORDERS` evade a policy on
+        // `sales.orders`, which is the evasion the folding exists to close.
+        let policies = analyst_orders();
+
+        for (database, table) in [
+            ("sales", "orders"),
+            ("SALES", "ORDERS"),
+            ("Sales", "Orders"),
+            ("sALES", "oRDERS"),
+        ] {
+            assert!(
+                policies
+                    .lookup("analyst", &TableRef::qualified(database, table), None)
+                    .is_restricted(),
+                "{database}.{table} must match the sales.orders policy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_table_name_is_rejected_naming_the_policy() {
+        // Regression: a policy on `ordres_é` did not match a query for
+        // `ordres_É`, because `to_ascii_lowercase` folds neither. The reference
+        // was forwarded unconstrained, with no refusal anywhere on the path.
+        // Such a policy can no longer be configured at all.
+        let message = config_error(
+            r#"
+            [[policy]]
+            user = "analyst"
+            database = "sales"
+            table = "ordres_é"
+            column = "region"
+            permitted_values = ["APAC"]
+            "#,
+        );
+
+        assert!(message.contains("non-ASCII character"), "{message}");
+        assert!(message.contains("policy #1"), "{message}");
+        assert!(message.contains("field `table`"), "{message}");
+    }
+
+    #[test]
+    fn a_non_ascii_database_name_is_rejected() {
+        let message = config_error(
+            r#"
+            [[policy]]
+            user = "analyst"
+            database = "vendës"
+            table = "orders"
+            column = "region"
+            permitted_values = ["APAC"]
+            "#,
+        );
+        assert!(message.contains("non-ASCII character"), "{message}");
+        assert!(message.contains("field `database`"), "{message}");
+    }
+
+    #[test]
+    fn a_non_ascii_column_name_is_rejected() {
+        let message = config_error(
+            r#"
+            [[policy]]
+            user = "analyst"
+            database = "sales"
+            table = "orders"
+            column = "région"
+            permitted_values = ["APAC"]
+            "#,
+        );
+        assert!(message.contains("non-ASCII character"), "{message}");
+        assert!(message.contains("field `column`"), "{message}");
+    }
+
+    #[test]
+    fn the_non_ascii_diagnostic_warns_against_unicode_lowercasing() {
+        // The obvious "fix" is `to_lowercase()`, which is also wrong. The
+        // diagnostic has to say so, or it will be applied.
+        let message = config_error(
+            r#"
+            [[policy]]
+            user = "analyst"
+            database = "sales"
+            table = "Ördérs"
+            column = "region"
+            permitted_values = ["APAC"]
+            "#,
+        );
+        assert!(message.contains("Unicode lowercasing"), "{message}");
+    }
+
+    #[test]
+    fn a_non_ascii_username_is_still_accepted() {
+        // Usernames are compared byte-for-byte and never folded, so they carry
+        // no folding asymmetry. Restricting them would cost function for no
+        // security gain — see the note to the lead about normalisation.
+        let policies = load(
+            r#"
+            [[policy]]
+            user = "josé"
+            database = "sales"
+            table = "orders"
+            column = "region"
+            permitted_values = ["APAC"]
+            "#,
+        )
+        .expect("a non-ASCII username is representable");
+
+        assert!(policies.has_any_policy("josé"));
+        assert!(policies
+            .lookup("josé", &TableRef::qualified("sales", "orders"), None)
+            .is_restricted());
+    }
+
+    #[test]
+    fn a_non_ascii_username_is_flagged_with_its_code_points() {
+        let policies = load(
+            r#"
+            [[policy]]
+            user = "josé"
+            database = "sales"
+            table = "orders"
+            column = "region"
+            permitted_values = ["APAC"]
+            "#,
+        )
+        .expect("a non-ASCII username loads");
+
+        let advisory = policies
+            .advisories()
+            .iter()
+            .find(|a| a.contains("josé"))
+            .expect("the username is flagged");
+
+        // Without the code points the warning is unactionable: the whole
+        // problem is that the two encodings render identically.
+        assert!(
+            advisory.contains("U+006A U+006F U+0073 U+00E9"),
+            "{advisory}"
+        );
+        assert!(advisory.contains("DIFFERENT account"), "{advisory}");
+        assert!(advisory.contains("applies to nobody"), "{advisory}");
+    }
+
+    #[test]
+    fn the_two_encodings_of_a_username_are_flagged_distinctly() {
+        // NFC josé and NFD josé, which no editor will show as different.
+        let policies = load(
+            "[[policy]]\nuser = \"jos\u{00e9}\"\ndatabase = \"sales\"\ntable = \"orders\"\n\
+             column = \"region\"\npermitted_values = [\"APAC\"]\n\n\
+             [[policy]]\nuser = \"jose\u{0301}\"\ndatabase = \"sales\"\ntable = \"orders\"\n\
+             column = \"region\"\npermitted_values = [\"EMEA\"]\n",
+        )
+        .expect("both usernames load as separate accounts");
+
+        // Two distinct users, not a duplicate-policy collision.
+        assert_eq!(policies.policy_count(), 2);
+        assert_eq!(policies.advisories().len(), 2);
+
+        let joined = policies.advisories().join("\n");
+        assert!(joined.contains("U+006A U+006F U+0073 U+00E9"), "{joined}");
+        assert!(
+            joined.contains("U+006A U+006F U+0073 U+0065 U+0301"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn usernames_that_render_identically_are_never_matched_together() {
+        // The mirror of the folding leak: applying one account's policy to
+        // another would be a disclosure, so exact matching is the correct rule.
+        let policies = load(
+            "[[policy]]\nuser = \"jos\u{00e9}\"\ndatabase = \"sales\"\ntable = \"orders\"\n\
+             column = \"region\"\npermitted_values = [\"APAC\"]\n",
+        )
+        .expect("valid configuration");
+
+        assert!(policies.has_any_policy("jos\u{00e9}"));
+        assert!(!policies.has_any_policy("jose\u{0301}"));
+        assert_eq!(
+            policies.lookup(
+                "jose\u{0301}",
+                &TableRef::qualified("sales", "orders"),
+                None
+            ),
+            PolicyDecision::Unrestricted
+        );
+    }
+
+    #[test]
+    fn an_ascii_only_configuration_raises_no_advisories() {
+        assert!(analyst_orders().advisories().is_empty());
+    }
+
+    #[test]
+    fn a_username_is_flagged_once_however_many_policies_it_has() {
+        let policies = load(
+            "[[policy]]\nuser = \"jos\u{00e9}\"\ndatabase = \"sales\"\ntable = \"orders\"\n\
+             column = \"region\"\npermitted_values = [\"APAC\"]\n\n\
+             [[policy]]\nuser = \"jos\u{00e9}\"\ndatabase = \"sales\"\ntable = \"invoices\"\n\
+             column = \"region\"\npermitted_values = [\"APAC\"]\n",
+        )
+        .expect("valid configuration");
+
+        assert_eq!(policies.policy_count(), 2);
+        assert_eq!(policies.advisories().len(), 1);
     }
 
     #[test]
@@ -1342,24 +1661,15 @@ mod tests {
     }
 
     #[test]
-    fn text_literal_escapes_quote_and_backslash() {
+    fn display_renders_the_value_as_written_without_sql_quoting() {
+        // Guards the replacement for `to_sql_literal`: if `Display` ever grows
+        // quotes or escaping again, `policy.rs` has a second SQL renderer in it.
+        assert_eq!(PermittedValue::Text("APAC".into()).to_string(), "APAC");
         assert_eq!(
-            PermittedValue::Text("APAC".into()).to_sql_literal(),
-            "'APAC'"
+            PermittedValue::Text("O'Brien".into()).to_string(),
+            "O'Brien"
         );
-        assert_eq!(
-            PermittedValue::Text("O'Brien".into()).to_sql_literal(),
-            "'O''Brien'"
-        );
-        assert_eq!(
-            PermittedValue::Text("a\\b".into()).to_sql_literal(),
-            "'a\\\\b'"
-        );
-    }
-
-    #[test]
-    fn integer_literal_is_unquoted() {
-        assert_eq!(PermittedValue::Integer(-7).to_sql_literal(), "-7");
+        assert_eq!(PermittedValue::Integer(-7).to_string(), "-7");
     }
 
     #[test]

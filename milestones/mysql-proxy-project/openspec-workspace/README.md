@@ -76,7 +76,11 @@ Listing only what is closed would read as a claim that the rest is handled.
 | **Collation-dependent matching** | `region IN ('APAC')` matches per Doris's collation. Under a case-insensitive collation `apac` matches too, which may be wider than intended. |
 | **Write statements** | Not constrained. `INSERT`/`UPDATE`/`DELETE`/`REPLACE` touching a policy table are refused outright. |
 | **Prepared statements** | `COM_STMT_PREPARE` is refused. The text seen at prepare time is not what executes at bind time. |
+| **Generated column labels** | A client reading column metadata sees a **different column name** than it would connecting to Doris directly, whenever an *unaliased* projection expression contains a policy table. MySQL derives such a label from the expression as written, and the injected guard is written into it: `(SELECT MAX(total) FROM sales.orders)` comes back labelled with the guard inside it. Column count, order and values are unaffected. The remedy is in your hands — an explicit alias survives the rewrite exactly, so `... AS peak` is labelled `peak`. |
+| **`db.table.column` references** | A column qualified by **both** database and table — `sales.orders.total` — stops resolving once the relation is wrapped and aliased to `orders`, and Doris returns an unknown-column error. The statement fails rather than returning unfiltered rows, so this costs compatibility and not confidentiality. Qualify by table or alias alone. |
 | **`sql_mode` dependence of literal rendering** | Values are emitted through `sqlparser`'s renderer. That its output means the same thing to Doris under both default `sql_mode` and `NO_BACKSLASH_ESCAPES` is **assumed, not verified** — no local test can settle it. Hazardous inputs are rejected at load to narrow the exposure. |
+| **Result rows larger than 16 MB** | Not relayed. A row whose packet reaches the MySQL framing limit of 2²⁴−1 bytes continues into a further packet, and the proxy refuses rather than reassembling — reassembly means buffering without a bound, which the memory invariant forbids. A large `BLOB` column will therefore fail the session rather than returning truncated. Connecting to the frontend directly would have worked. See ADR 0003. |
+| **No timeouts anywhere** | A client that connects and then sends nothing holds one task and one backend connection **indefinitely**. So does a backend that accepts the connection and never completes the handshake. There is no idle timeout, no connection-phase timeout and no connection cap, so an unauthenticated client can consume Doris frontend connections one per attempt — the backend connection is opened *before* the client authenticates, which passthrough authentication requires. Bound this outside the proxy, at the network layer or with a frontend connection limit. See ADR 0004. |
 
 ## Development
 
@@ -98,6 +102,7 @@ cargo clippy --all-targets -- -D warnings
 | `src/session.rs` | Client sessions, 1:1 backend mapping, passthrough auth by relaying Doris's salt |
 | `src/error.rs` | Refusal reasons. Deliberately has no "could not analyse, forwarded anyway" variant |
 | `src/main.rs` | Startup ordering: `serve` takes `PolicySet` by value so the bind cannot precede validation |
-| `notes/adr-material.md` | Findings captured during implementation, to be promoted into ADRs |
+| `docs/adr/` | Decision records for the parts that are not spec-shaped: task topology, buffer ownership, cancellation, error-enum shape, protocol crate choice |
+| `notes/adr-material.md` | The raw findings the ADRs were written from, including evidence that did not become a decision |
 
 The specification lives in `openspec/`. `openspec/changes/add-row-filter-proxy-mvp/` holds the proposal, design and per-capability specs; the design document's decision records explain *why* each mechanism is shaped the way it is, and its bypass tables are the authoritative version of the gaps listed above.

@@ -86,11 +86,6 @@ impl TableName {
         }
     }
 
-    /// The parts as written, outermost qualifier first.
-    pub fn parts(&self) -> &[String] {
-        &self.parts
-    }
-
     /// The table part of the name, ignoring any database qualifier.
     pub fn leaf(&self) -> &str {
         self.parts.last().expect("TableName is never empty")
@@ -193,6 +188,9 @@ pub struct Analysis {
 /// rejection of the most ordinary thing a client sends. Pinned by
 /// `a_trailing_semicolon_is_not_a_second_statement` in `tests/analyze_walk.rs`.
 pub fn parse_single(sql: &str) -> AnalysisResult<Statement> {
+    if contains_executable_comment(sql) {
+        return unsupported("conditionally-executed comment");
+    }
     let mut statements =
         Parser::parse_sql(&MySqlDialect {}, sql).map_err(|_| RefusalReason::Unparseable)?;
     match statements.len() {
@@ -207,6 +205,129 @@ pub fn parse_single(sql: &str) -> AnalysisResult<Statement> {
         1 => Ok(statements.pop().expect("length checked")),
         _ => Err(RefusalReason::MultiStatement),
     }
+}
+
+/// Whether `sql` contains a MySQL *executable* comment, `/*! ... */`.
+///
+/// # Why this is refused rather than handled
+///
+/// MySQL runs the contents of `/*!NNNNN ... */` only when the server version is
+/// at least `NNNNN`, and `/*! ... */` always. **`sqlparser` parses the contents
+/// as ordinary SQL and discards the gate**, so the fragment is enumerated and
+/// constrained like any other SQL — but re-rendering the AST emits it with the
+/// gate gone, and the statement reaching Doris executes unconditionally what the
+/// original might never have run. Measured:
+///
+/// ```text
+/// in   SELECT /*!99999 id, */ region FROM sales.orders
+/// out  SELECT id, region FROM (SELECT * FROM sales.orders WHERE `region` IN (...)) AS orders
+/// ```
+///
+/// One column becomes two. A gated `UNION` branch becomes an unconditional one.
+/// That breaks invariant 4 and the "column shape is unchanged by rewriting"
+/// scenario, so the statement must not be forwarded.
+///
+/// This is not excessive caution about comments — ordinary `/* */` and `--`
+/// comments are discarded identically by `sqlparser` and by Doris and are fine.
+/// It is specifically that the *gate* is a condition the backend evaluates about
+/// itself, and re-rendering resolves it on the backend's behalf. Preserving it
+/// would mean re-emitting `/*!NNNNN */` around a fragment of the AST, which is a
+/// great deal of machinery for a construct that has no business crossing a
+/// filtering proxy.
+///
+/// # Why the scan is textual, and why it is deliberately trigger-happy
+///
+/// The gate is gone by the time a `Statement` exists, so this has to run on the
+/// text. The scanner skips string literals, quoted identifiers and ordinary
+/// comments, so a `/*!` *inside* a literal is not a false positive.
+///
+/// Two rules are set so that mis-tracking errs toward flagging rather than
+/// missing:
+///
+/// - **Backslash escapes are not honoured inside string literals.** Honouring
+///   them is correct only under MySQL's default `sql_mode`; under
+///   `NO_BACKSLASH_ESCAPES` a backslash is literal. Guessing wrong in that
+///   direction would keep the scanner *inside* a string past its real end and
+///   could step over a marker. Not honouring them ends strings earlier, which
+///   can only produce a spurious refusal. Same reasoning `policy-config` applies
+///   to permitted values: prefer the rule that is correct under every
+///   `sql_mode`.
+/// - **`--` starts a comment only when followed by whitespace or end of input**,
+///   which is MySQL's own rule. Treating it as a comment unconditionally would
+///   skip the rest of the line in `SELECT 1--2 /*!99999 ... */` and miss the
+///   marker.
+fn contains_executable_comment(sql: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Normal,
+        Quoted(u8),
+        LineComment,
+        BlockComment,
+    }
+
+    // Byte-wise is safe for UTF-8: every byte of a multi-byte sequence has the
+    // high bit set, so none can collide with the ASCII delimiters matched here.
+    let bytes = sql.as_bytes();
+    let mut state = State::Normal;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match state {
+            State::Normal => match byte {
+                b'\'' | b'"' | b'`' => {
+                    state = State::Quoted(byte);
+                    i += 1;
+                }
+                b'#' => {
+                    state = State::LineComment;
+                    i += 1;
+                }
+                b'-' if bytes.get(i + 1) == Some(&b'-')
+                    && bytes.get(i + 2).is_none_or(u8::is_ascii_whitespace) =>
+                {
+                    state = State::LineComment;
+                    i += 2;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    if bytes.get(i + 2) == Some(&b'!') {
+                        return true;
+                    }
+                    state = State::BlockComment;
+                    i += 2;
+                }
+                _ => i += 1,
+            },
+            State::Quoted(quote) => {
+                if byte == quote {
+                    // A doubled delimiter is a literal one and does not close.
+                    if bytes.get(i + 1) == Some(&quote) {
+                        i += 2;
+                    } else {
+                        state = State::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Normal;
+                }
+                i += 1;
+            }
+            State::BlockComment => {
+                if byte == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    state = State::Normal;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Parse a statement and enumerate every table reference in it.
@@ -314,6 +435,15 @@ pub trait SiteVisitor {
 /// Compared case-insensitively, matching MySQL's treatment of CTE names.
 type CteScope = Vec<String>;
 
+/// Whether `name` resolves to a common table expression rather than a stored
+/// table.
+///
+/// The `is_unqualified` half is load-bearing and is the fail-open direction if
+/// it is ever dropped: a *qualified* name always denotes a table, so
+/// `WITH orders AS (…) SELECT * FROM sales.orders` reads the real
+/// `sales.orders`, and treating it as a CTE reference would forward it with no
+/// predicate at all. Pinned by
+/// `a_qualified_reference_is_not_shadowed_by_a_same_named_cte`.
 fn shadowed(scope: &CteScope, name: &TableName) -> bool {
     name.is_unqualified() && scope.iter().any(|c| c.eq_ignore_ascii_case(name.leaf()))
 }

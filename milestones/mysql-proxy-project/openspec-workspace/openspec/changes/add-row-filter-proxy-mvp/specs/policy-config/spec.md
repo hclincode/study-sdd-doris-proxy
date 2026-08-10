@@ -85,6 +85,26 @@ The proxy SHALL compare database and table names ASCII-case-insensitively when m
 - **WHEN** a policy is configured for user `analyst` and user `Analyst` connects
 - **THEN** `Analyst` is not subject to `analyst`'s policy
 
+#### Scenario: An identifier the proxy cannot fold faithfully is refused at load
+
+- **WHEN** a configured policy names a database, table, or column containing a character outside the range the proxy can case-fold faithfully
+- **THEN** the proxy exits with a diagnostic naming the offending policy, rather than starting with a policy whose matching is case-sensitive for those characters and case-insensitive for the rest
+
+#### Scenario: A username that could be written two indistinguishable ways is flagged at startup
+
+- **WHEN** a configured policy names a user containing a character that has more than one encoding rendering identically on screen
+- **THEN** the proxy starts, and warns naming that username together with its code points, so an operator can compare it against the account the backend holds
+
+#### Scenario: Usernames are matched exactly, never normalised
+
+- **WHEN** a policy names a user whose encoding differs from an authenticated account that renders identically
+- **THEN** the policy does not apply to that account, because the backend treats the two as different accounts and applying one account's policy to another would be a disclosure
+
+#### Scenario: Refusal, not a narrower folding rule
+
+- **WHEN** a policy identifier cannot be matched identically under every backend identifier-folding setting
+- **THEN** the configuration is refused, and the proxy does NOT substitute a folding rule that is correct under only some settings
+
 #### Scenario: Case-colliding policies for one user are a configuration error
 
 - **WHEN** the configuration declares policies for one user on both `sales.orders` and `sales.ORDERS`

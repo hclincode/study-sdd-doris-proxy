@@ -75,7 +75,7 @@ fn permitted_value_expr(value: &PermittedValue) -> Expr {
 fn escape_quotes(value: &str) -> String {
     debug_assert!(
         !value.contains('\\'),
-        "permitted value {value:?} contains a backslash, which `policy-config` rejects at load          time because no rendering of it is correct under every `sql_mode`"
+        "permitted value {value:?} contains a backslash; `policy-config` rejects these at load because no rendering of one is correct under every `sql_mode`"
     );
     value.replace('\'', "''")
 }

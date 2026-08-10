@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use doris_row_filter_proxy::error::ProxyError;
-use doris_row_filter_proxy::policy::{PolicyDecision, PolicySet, TableRef};
+use doris_row_filter_proxy::policy::{PermittedValue, PolicyDecision, PolicySet, TableRef};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -247,14 +247,16 @@ permitted_values = ["APAC"]
 
     // The loaded set is what the process enforces, not what is on disk now.
     let decision = policies.lookup("analyst", &TableRef::qualified("sales", "orders"), None);
-    let values: Vec<String> = decision
-        .policy()
-        .expect("policy applies")
-        .permitted_values()
-        .iter()
-        .map(|value| value.to_sql_literal())
-        .collect();
-    assert_eq!(values, ["'APAC'", "'EMEA'"]);
+    assert_eq!(
+        decision
+            .policy()
+            .expect("policy applies")
+            .permitted_values(),
+        [
+            PermittedValue::Text("APAC".into()),
+            PermittedValue::Text("EMEA".into())
+        ]
+    );
 
     assert!(!policies.has_any_policy("reporting"));
     assert_eq!(

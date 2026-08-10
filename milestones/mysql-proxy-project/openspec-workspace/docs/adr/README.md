@@ -29,6 +29,7 @@ belongs in its successor, not in an edit.
 | [0003](0003-buffer-ownership.md) | One packet in memory at a time, result sets relayed row at a time, hard size limits, continued packets refused |
 | [0004](0004-cancellation-by-drop.md) | No cancellation machinery — the backend socket is a field of the session, so ending the session closes it |
 | [0005](0005-error-enum-shape.md) | Three error types split by audience: client, operator, and the code that must not be able to say "forwarded anyway" |
+| [0006](0006-remove-mysql-async.md) | `mysql_async` removed — nothing used it, because the result-set relay is hand-rolled too. Supersedes 0001's "retained pending a decision" |
 
 `../../notes/adr-material.md` holds the raw notes these were written from,
 including evidence that did not make it into a decision. It is a scratch record
@@ -39,4 +40,8 @@ with provenance, not authoritative.
 0001 first: it is the only one that constrains the others. 0002 and 0004 are a
 pair — cancellation by `Drop` works *because* there is one task per session, so
 changing the topology reopens the cancellation question. 0003 and 0005 stand
-alone.
+alone. 0006 is a one-page amendment to 0001 and is only interesting alongside it.
+
+0006 is also the first application of the immutability rule above, to the ADR
+whose author wrote the rule. It is a successor rather than an edit for that
+reason: a rule that bends the first time it is inconvenient was never a rule.

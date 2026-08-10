@@ -76,6 +76,16 @@ The proxy SHALL reject, with an error returned to the client, any statement it c
 - **WHEN** `analyst` issues a parseable statement containing a construct for which the proxy cannot determine whether a policy-bearing table is referenced
 - **THEN** the proxy returns an error to the client and forwards nothing to the backend
 
+#### Scenario: A statement whose execution depends on the backend's identity is refused
+
+- **WHEN** a user with at least one configured policy issues a statement containing a conditionally-executed comment, whose content the backend runs or ignores depending on its own version
+- **THEN** the proxy returns an error and forwards nothing, rather than forwarding a statement in which that condition has been resolved on the backend's behalf
+
+#### Scenario: Rewriting never adds to what the original would have executed
+
+- **WHEN** a statement is rewritten
+- **THEN** the statement reaching the backend executes no projection, relation, or set-operation branch that the original statement would not have executed
+
 #### Scenario: Rejection names the reason without disclosing policy contents
 
 - **WHEN** the proxy rejects a statement

@@ -76,7 +76,13 @@ The single mechanism is the point: one rule proven once, rather than a per-posit
 
 **Alternative considered — append `AND <policy>` to each `SELECT`'s `WHERE`.** Simpler to implement and produces more idiomatic SQL, but it requires parenthesising the user's predicate correctly in every case, and it is outright wrong for outer joins. Rejected.
 
-**Known cost.** A column reference qualified by database *and* table (`sales.orders.total`) no longer resolves once the relation is aliased to `orders`. Doris returns an unknown-column error. This is a visible compatibility loss, not a leak — the query fails rather than returning unfiltered rows.
+**Known costs.** Two, both visible compatibility losses rather than leaks.
+
+1. A column reference qualified by database *and* table (`sales.orders.total`) no longer resolves once the relation is aliased to `orders`. Doris returns an unknown-column error — the query fails rather than returning unfiltered rows.
+
+2. **An unaliased projection expression containing a guarded relation gets a different generated column label.** MySQL derives the label of an unaliased expression from the expression *as written*, so when the guard is injected into it the label changes with it — `(SELECT MAX(total) FROM sales.orders)` becomes `(SELECT MAX(total) FROM (SELECT * FROM sales.orders WHERE …) AS orders)`. A client reading column metadata sees a different name than it would connecting to Doris directly. Column count, order and values are unaffected, and an explicit alias survives the rewrite exactly, so the remedy is in the author's hands.
+
+   Found by the property test asserting that rewriting never adds to what the original would have executed, not by inspection — every hand-written test used simple projections, so the case had gone unexamined while the scenario stood argued-only. Worth recording as evidence for property tests over shapes nobody thinks to write by hand.
 
 ### D3: Enumerate table references with an allowlist walk, and refuse on anything unrecognised
 
@@ -137,6 +143,7 @@ Listing only what is closed would read as a claim that the rest is handled. Both
 | Multi-statement smuggling, including via comments | **SQL-level statement-count check** — refuse when parsing yields more than one statement. D4's capability clearing is defence in depth only; see the correction under D4, which explains why it is not enforcement |
 | Prepare/bind text divergence | D4 — `COM_STMT_PREPARE` refused |
 | Unparseable SQL forwarded uncapped | D6 — rejected for any policy-bearing user |
+| Version-gated `/*! ... */` content executing unconditionally | Refused outright. `sqlparser` parses the content as real SQL and **discards the gate**, so re-rendering the AST executes it whatever the backend's version — changing column shape and adding set-operation branches, in breach of invariants 3 and 4. Note the asymmetry that shapes the fix: the forward-verbatim paths are safe *because* they return the original text with the gate intact, so only the re-render loses it |
 | A new `sqlparser` node type silently passing through | D3 — allowlist walk |
 
 **Left open, and why:**
@@ -146,7 +153,8 @@ Listing only what is closed would read as a claim that the rest is handled. Both
 | **Direct connection to the Doris FE** | Out of the proxy's reach entirely. A deployment precondition, stated in the proposal. This is the largest gap and the reason native `CREATE ROW POLICY` remains the stronger control. |
 | **Views over policy tables** | The proxy sees a view name, not its definition, and cannot distinguish a view from a table without consulting the catalogue. A view defined over `sales.orders` returns unfiltered rows. Not mitigated in the MVP. |
 | **`information_schema` and `SHOW`** | Not filtered. Table existence, column names and row-count statistics remain visible. |
-| **Parser differential** | The deepest risk: SQL that `sqlparser` parses into one meaning and Doris executes as another. The proxy would constrain the reference it believes exists while Doris reads something else. Rejection cannot help here, because nothing appears to have failed. Not mitigated; see Risks. |
+| **Parser differential** | The deepest risk: SQL that `sqlparser` parses into one meaning and Doris executes as another. The proxy would constrain the reference it believes exists while Doris reads something else. Rejection cannot help here, because nothing appears to have failed. Not mitigated; see Risks. **Sharpest known instance:** `WITH orders AS (SELECT 1 AS region) SELECT * FROM orders` is forwarded verbatim and unconstrained, because the proxy asserts that `orders` names a CTE rather than the policy table. This is the only place it asserts an identifier is *not* a table and forwards with zero constraint. Correct under MySQL scoping, which the walk implements carefully; wrong if Doris's CTE resolution ever differs. First thing to check against a real backend (task 8.5). |
+| **Identifier folding beyond ASCII** | Policy matching folds identifier case, but only over ASCII. A policy naming a non-ASCII table therefore matched case-*sensitively* while the stated rationale assumed the opposite, so it **under**-applied — a disclosure — on any backend that folds case (`lower_case_table_names=1`). Closed by refusing non-ASCII identifiers at load, on the same reasoning as permitted values: refusal is correct under every backend setting, a folding rule only under some. Recorded because the defect was the *asymmetry between the rationale and the implementation*, not the folding, and that shape is easy to reintroduce. |
 | **Collation-dependent value matching** | `region IN ('APAC')` matches according to Doris's collation. Under a case-insensitive collation, `apac` matches too, which may be wider than the policy author intended. |
 | **Functions and expressions with side effects or catalogue access** | Not analysed beyond table-reference enumeration. |
 

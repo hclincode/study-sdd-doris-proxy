@@ -19,8 +19,8 @@
 //!
 //! The rewriter emits permitted values by mapping `policy::PermittedValue` onto
 //! a `sqlparser` `Value` and letting the renderer quote it, so `rendered` below
-//! is the real output path. `PermittedValue::to_sql_literal` is *not* on that
-//! path — it is for diagnostics and tests, and escapes differently.
+//! is the real output path — and the only one. `policy.rs` renders no SQL at
+//! all, so these assertions pin `sqlparser`'s behaviour rather than ours.
 
 use doris_row_filter_proxy::error::ProxyError;
 use doris_row_filter_proxy::policy::{PermittedValue, PolicySet, TableRef};
@@ -182,13 +182,8 @@ fn the_renderer_would_leave_an_already_doubled_quote_alone() {
     assert_eq!(rendered(&value), "'a''b'");
 }
 
-#[test]
-fn to_sql_literal_escapes_differently_from_the_renderer() {
-    // Why to_sql_literal must not be used to build AST literals: the two
-    // disagree, and feeding one into the other escapes twice.
-    let value = PermittedValue::Text("a\\b".into());
-
-    assert_eq!(value.to_sql_literal(), "'a\\\\b'");
-    assert_eq!(rendered(&value), "'a\\b'");
-    assert_ne!(value.to_sql_literal(), rendered(&value));
-}
+// `to_sql_literal_escapes_differently_from_the_renderer` lived here. It guarded
+// against using `PermittedValue::to_sql_literal` to build AST literals, which
+// would have double-escaped. That method has been deleted, so the mistake is no
+// longer possible and a guard against it would only puzzle a later reader. The
+// HAZARD tests above stay: they pin `sqlparser`, which is still here.

@@ -160,6 +160,35 @@ fn a_later_cte_name_does_not_mask_a_table_read_by_an_earlier_body() {
     );
 }
 
+/// A *qualified* name always denotes a stored table, so a CTE cannot mask one by
+/// sharing its bare name. `WITH orders AS (…) SELECT * FROM sales.orders` reads
+/// the real `sales.orders`.
+///
+/// This is the fail-open direction if the qualification check in `shadowed` is
+/// ever lost: the reference would be classified as a CTE, carry no policy, and
+/// be forwarded with no predicate. Found by mutation testing — the surviving
+/// mutant replaced `TableName::is_unqualified` with `true`, and nothing caught
+/// it because every other CTE test uses a CTE name that matches no policy table.
+#[test]
+fn a_qualified_reference_is_not_shadowed_by_a_same_named_cte() {
+    let analysis =
+        analyze("WITH orders AS (SELECT 1 AS region) SELECT * FROM sales.orders JOIN orders")
+            .unwrap();
+    assert_eq!(
+        analysis
+            .tables
+            .iter()
+            .map(|t| (t.name.to_string(), t.is_cte_reference))
+            .collect::<Vec<_>>(),
+        [
+            // Qualified: the stored table, whatever CTEs are in scope.
+            ("sales.orders".to_string(), false),
+            // Unqualified and matching the CTE: the CTE.
+            ("orders".to_string(), true),
+        ]
+    );
+}
+
 #[test]
 fn a_recursive_cte_may_refer_to_itself() {
     let analysis = analyze(
@@ -327,6 +356,104 @@ fn a_trailing_semicolon_is_not_a_second_statement() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Executable comments
+// ---------------------------------------------------------------------------
+
+/// Spec: "A statement whose execution depends on the backend's identity is
+/// refused".
+///
+/// `sqlparser` parses the contents of `/*!NNNNN ... */` as ordinary SQL and
+/// throws the version gate away. The fragment is therefore enumerated and
+/// constrained — but re-rendering the AST emits it *ungated*, so the statement
+/// reaching Doris runs unconditionally what the original might never have run.
+/// Measured before this refusal existed:
+///
+/// ```text
+/// in   SELECT /*!99999 id, */ region FROM sales.orders
+/// out  SELECT id, region FROM (SELECT * FROM sales.orders WHERE `region` IN (…)) AS orders
+/// ```
+///
+/// One column became two, which is the "Column shape is unchanged by rewriting"
+/// scenario violated, and a gated `UNION` branch became unconditional, which is
+/// invariant 4 violated.
+#[test]
+fn a_conditionally_executed_comment_is_refused() {
+    for sql in [
+        "SELECT /*!99999 id, */ region FROM sales.orders",
+        "SELECT /*!50000 1, */ * FROM sales.orders",
+        "SELECT * FROM sales.products /*! UNION SELECT * FROM sales.orders */",
+        "SELECT * FROM sales.products /*!99999 UNION SELECT * FROM sales.orders */",
+        "/*!50000 SELECT * FROM sales.orders */",
+        "SELECT * FROM /*! sales.orders */",
+    ] {
+        let reason = refusal(sql);
+        let RefusalReason::UnsupportedShape { construct } = &reason else {
+            panic!("{sql:?} should refuse as an unsupported shape, got {reason:?}");
+        };
+        assert_eq!(construct, "conditionally-executed comment", "for {sql:?}");
+    }
+}
+
+/// The refusal is about the *gate*, not about comments. An ordinary comment is
+/// discarded identically by `sqlparser` and by Doris, so it stays supported —
+/// otherwise this check would look like superstition and get deleted.
+#[test]
+fn an_ordinary_comment_is_not_refused() {
+    for sql in [
+        "SELECT * FROM sales.orders /* plain */",
+        "SELECT * FROM sales.orders -- plain",
+        "SELECT * FROM sales.orders # plain",
+        "/* leading */ SELECT * FROM sales.orders",
+        "SELECT /* inline */ * FROM sales.orders",
+        // A marker that only appears *inside* an ordinary comment is inert:
+        // MySQL does not nest block comments, so this one ends at the first `*/`.
+        "SELECT * FROM sales.orders /* not really /*! */",
+    ] {
+        assert!(
+            analyze(sql).is_ok(),
+            "{sql:?} should still analyse: {:?}",
+            analyze(sql).err()
+        );
+    }
+}
+
+/// A marker inside a string literal or a quoted identifier is data, not a gate,
+/// and must not trigger a refusal — otherwise any query mentioning the sequence
+/// becomes unrunnable.
+#[test]
+fn a_marker_inside_a_literal_is_not_a_conditionally_executed_comment() {
+    for sql in [
+        "SELECT * FROM sales.orders WHERE note = '/*!99999 x */'",
+        "SELECT '/*!' FROM sales.orders",
+        "SELECT * FROM sales.orders WHERE note = 'it''s /*! fine'",
+        "SELECT `/*!weird`.x FROM sales.orders",
+        "SELECT * FROM sales.orders WHERE note = \"/*! also fine\"",
+    ] {
+        assert!(
+            analyze(sql).is_ok(),
+            "{sql:?} should still analyse: {:?}",
+            analyze(sql).err()
+        );
+    }
+}
+
+/// `--` begins a comment only when whitespace follows, which is MySQL's rule.
+/// Treating it as a comment unconditionally would skip the rest of the line and
+/// step straight over the marker in the first case here.
+#[test]
+fn a_marker_after_a_double_minus_operator_is_still_detected() {
+    for sql in [
+        "SELECT 1--2 /*!99999 UNION SELECT * FROM sales.orders */",
+        "SELECT 1-- comment\n/*!99999 UNION SELECT * FROM sales.orders */",
+    ] {
+        assert!(
+            matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
+            "{sql:?} should be refused"
+        );
+    }
+}
+
 /// A request with no statement in it at all — empty, whitespace, or nothing but
 /// a comment — is refused rather than forwarded. MySQL itself errors on an empty
 /// query, so this costs no compatibility.
@@ -355,6 +482,77 @@ fn a_cannot_analyse_refusal_names_the_offending_construct() {
         panic!("expected an unsupported-shape refusal");
     };
     assert_eq!(construct, "LATERAL VIEW clause");
+}
+
+/// MySQL's own `SELECT` modifiers are not on the allowlist and are refused.
+///
+/// Reachable, unlike most of the exotic clauses the walk guards against:
+/// `MySqlDialect` populates `Select::select_modifiers` for `SQL_CALC_FOUND_ROWS`,
+/// `HIGH_PRIORITY`, `STRAIGHT_JOIN` and `SQL_NO_CACHE`. Found by mutation
+/// testing — inverting the comparison in that guard stopped it refusing and no
+/// test noticed.
+///
+/// `SQL_CALC_FOUND_ROWS` in particular has an effect the rewrite cannot preserve:
+/// it makes `FOUND_ROWS()` report the row count *before* `LIMIT`, computed over
+/// the guarded relation rather than the table.
+#[test]
+fn a_mysql_select_modifier_is_refused() {
+    for sql in [
+        "SELECT SQL_CALC_FOUND_ROWS * FROM sales.orders",
+        "SELECT HIGH_PRIORITY * FROM sales.orders",
+        "SELECT STRAIGHT_JOIN * FROM sales.orders",
+        "SELECT SQL_NO_CACHE * FROM sales.orders",
+    ] {
+        let RefusalReason::UnsupportedShape { construct } = refusal(sql) else {
+            panic!("{sql:?} should refuse as an unsupported shape");
+        };
+        assert_eq!(construct, "MySQL SELECT modifier", "for {sql:?}");
+    }
+}
+
+/// `GROUP BY ALL` parses under `MySqlDialect` into `GroupByExpr::All`, and the
+/// walk currently accepts it — it introduces no table reference, and it round-
+/// trips through rendering unchanged.
+///
+/// Pinned so the behaviour is deliberate rather than accidental. Found by
+/// mutation testing: inverting the guard in that arm turns acceptance into
+/// refusal, and nothing exercised `GROUP BY ALL` either way.
+///
+/// The guard it sits behind — `GROUP BY ALL <modifier>` — is unreachable through
+/// this dialect: `MySqlDialect` does not parse `WITH ROLLUP` at all, not even in
+/// the plain `GROUP BY a WITH ROLLUP` form that is ordinary MySQL. So the arm is
+/// reachable but its modifier check is not.
+///
+/// Worth a decision rather than a test alone. `ALL` is reserved in MySQL, so
+/// Doris rejects `GROUP BY ALL` outright — `sqlparser` and the backend disagree
+/// about what this statement is. Refusing it would suit the allowlist better and
+/// would cost nothing that works today.
+#[test]
+fn group_by_all_is_accepted() {
+    let analysis = analyze("SELECT region FROM sales.orders GROUP BY ALL").unwrap();
+    assert_eq!(
+        analysis
+            .tables
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect::<Vec<_>>(),
+        ["sales.orders"]
+    );
+}
+
+/// `WITH ROLLUP` is ordinary MySQL and `sqlparser`'s `MySqlDialect` cannot parse
+/// it, so a policy-bearing user is refused a common reporting query.
+///
+/// Recorded here rather than only in a note because it is a *compatibility* gap
+/// of exactly the kind design D6 accepts, and the test will start failing if a
+/// later `sqlparser` learns the syntax — at which point the allowlist needs a
+/// decision about `GroupByWithModifier` rather than silently accepting it.
+#[test]
+fn group_by_with_rollup_is_not_parseable_by_this_dialect() {
+    assert!(matches!(
+        refusal("SELECT region FROM sales.orders GROUP BY region WITH ROLLUP"),
+        RefusalReason::Unparseable
+    ));
 }
 
 #[test]

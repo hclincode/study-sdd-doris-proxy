@@ -10,9 +10,14 @@
 #[path = "rewrite_fixture.rs"]
 mod fixture;
 
-use doris_row_filter_proxy::analyze::parse_single;
+use std::collections::BTreeSet;
+
+use doris_row_filter_proxy::analyze::{analyze, parse_single};
 use doris_row_filter_proxy::policy::PolicySet;
+use fixture::statement_against_the_policy_table;
 use fixture::{assert_fully_guarded, forwarded, guard_count, ORDERS_GUARD};
+use proptest::prelude::*;
+use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
 
 // ---------------------------------------------------------------------------
 // Design D2 position table
@@ -441,5 +446,172 @@ fn an_empty_permitted_set_is_rejected_before_any_rewriting() {
     assert!(
         error.to_string().contains("permitted_values"),
         "diagnostic does not name the offending field: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spec: "Rewriting never adds to what the original would have executed"
+// ---------------------------------------------------------------------------
+
+/// What a projection item contributes to the result's column shape: how many
+/// columns, in what position, under what name.
+///
+/// Deliberately **not** the expression's text. A projection item may itself
+/// contain a subquery — `SELECT (SELECT MAX(total) FROM sales.orders) FROM …` —
+/// and the rewriter must guard the relation inside it, which changes the text
+/// legitimately. Comparing text here would report that correct behaviour as a
+/// violation. Count, order, wildcard kind and explicit alias are what the client
+/// observes as shape; the expression's internals are pinned by the exact-output
+/// tests above and by task 7.7.
+fn item_shape(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Wildcard(_) => "*".to_string(),
+        SelectItem::QualifiedWildcard(kind, _) => format!("{kind}.*"),
+        SelectItem::ExprWithAlias { alias, .. } => format!("alias:{alias}"),
+        // An unaliased expression. Its column label is derived by the backend
+        // from the expression text, so a guard inside it does change that label
+        // — a real but cosmetic consequence of design D2, noted with the test
+        // below rather than asserted against here.
+        _ => "expr".to_string(),
+    }
+}
+
+/// The projection shapes that decide the client-visible column layout: one list
+/// per top-level set-operation branch, plus each CTE's own.
+///
+/// Deliberately does **not** descend into a relation. A guard is a derived table
+/// living inside `Select::from`, so its inner `SELECT *` is invisible here —
+/// which is the point. The guard is allowed to add a projection nobody can see;
+/// it is not allowed to change one the client can.
+fn visible_projections(statement: &Statement) -> Vec<Vec<String>> {
+    fn walk(body: &SetExpr, out: &mut Vec<Vec<String>>) {
+        match body {
+            SetExpr::Select(select) => {
+                out.push(select.projection.iter().map(item_shape).collect::<Vec<_>>())
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            SetExpr::Query(query) => walk_query(query, out),
+            _ => {}
+        }
+    }
+    fn walk_query(query: &Query, out: &mut Vec<Vec<String>>) {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                walk_query(&cte.query, out);
+            }
+        }
+        walk(&query.body, out);
+    }
+
+    let mut out = Vec::new();
+    if let Statement::Query(query) = statement {
+        walk_query(query, &mut out);
+    }
+    out
+}
+
+/// Every stored table the statement reads, by the name it was written under.
+///
+/// CTE references are excluded: they name a query, not a table, and Doris never
+/// resolves them to storage.
+fn tables_read(sql: &str) -> BTreeSet<String> {
+    analyze(sql)
+        .expect("statement should analyse")
+        .tables
+        .iter()
+        .filter(|table| !table.is_cte_reference)
+        .map(|table| table.name.to_string())
+        .collect()
+}
+
+proptest! {
+    /// The scenario says *never adds*, which is a claim about everything the
+    /// rewrite might have introduced — not only about the rows it removes. Until
+    /// now that claim was argued from design D2 and demonstrated only on the
+    /// hand-written shapes above; a scenario nothing proves reads as coverage
+    /// and is not.
+    ///
+    /// Three additions are checkable without a Doris to query, and each would be
+    /// a distinct kind of harm:
+    ///
+    /// - a **new column** in any branch the client can see would change the
+    ///   result shape, which invariant 4 forbids outright;
+    /// - a **new set-operation branch** would add rows from somewhere the client
+    ///   did not ask about;
+    /// - a **new table name** would make Doris read something the user never
+    ///   named — the most serious, since the guard's whole justification is that
+    ///   it re-reads *the same relation* under a predicate.
+    ///
+    /// Placeholder count is included because invariant 3 makes it a correctness
+    /// property for the client's own parameter binding, not just a nicety.
+    #[test]
+    fn rewriting_never_adds_to_what_the_original_would_have_executed(
+        sql in statement_against_the_policy_table()
+    ) {
+        let policies = fixture::TestPolicies::analyst();
+        let Ok(forwarded) = policies.rewrite(&sql) else {
+            // A refusal adds nothing by definition.
+            return Ok(());
+        };
+
+        let original = parse_single(&sql).expect("a rewritten statement must have parsed");
+        let rewritten = parse_single(&forwarded).expect("the rewrite must re-parse");
+
+        prop_assert_eq!(
+            visible_projections(&rewritten),
+            visible_projections(&original),
+            "rewriting {:?} changed the client-visible projections",
+            sql
+        );
+
+        prop_assert_eq!(
+            tables_read(&forwarded),
+            tables_read(&sql),
+            "rewriting {:?} changed which stored tables are read",
+            sql
+        );
+
+        prop_assert_eq!(
+            forwarded.matches('?').count(),
+            sql.matches('?').count(),
+            "rewriting {:?} changed the placeholder count",
+            sql
+        );
+    }
+}
+
+/// A consequence of design D2 that the property test above surfaced, and the
+/// reason it compares projection *shape* rather than projection text.
+///
+/// MySQL derives the column label of an unaliased expression from the
+/// expression as written. When that expression contains a relation the rewriter
+/// guards, the guard appears in the label, so a client reading column metadata
+/// sees a different name than it would connecting to Doris directly. The column
+/// count, order and values are unaffected.
+///
+/// This is the same category as design D2's known cost for `db.table.column`
+/// references: a visible compatibility loss, not a disclosure. Recorded as a
+/// test so it is a known property rather than a surprise, together with the
+/// remedy — an explicit alias is preserved exactly, so an operator hitting this
+/// can pin the label themselves.
+#[test]
+fn an_unaliased_projection_subquery_changes_its_generated_column_label() {
+    let unaliased = "SELECT (SELECT MAX(total) FROM sales.orders) FROM sales.products";
+    let forwarded = assert_fully_guarded(unaliased);
+    assert!(
+        forwarded.contains("(SELECT MAX(total) FROM (SELECT * FROM sales.orders"),
+        "expected the projection's own relation to be guarded: {forwarded}"
+    );
+
+    // The remedy: an explicit alias survives the rewrite untouched, so the
+    // client-visible label is whatever the author chose.
+    let aliased = "SELECT (SELECT MAX(total) FROM sales.orders) AS peak FROM sales.products";
+    let forwarded = assert_fully_guarded(aliased);
+    assert!(
+        forwarded.ends_with("AS peak FROM sales.products"),
+        "an explicit alias must be preserved exactly: {forwarded}"
     );
 }

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d2c37f5ba7e4ca6b99407c400f5d56073aa1036b4a789b563e4ab10a72158c31 # shrinks to sql = "SELECT (SELECT MAX(total) FROM sales.orders) FROM sales.orders"

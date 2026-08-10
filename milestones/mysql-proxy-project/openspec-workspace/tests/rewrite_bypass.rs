@@ -11,7 +11,10 @@
 mod fixture;
 
 use doris_row_filter_proxy::analyze::analyze;
-use fixture::{assert_fully_guarded, guard_count, TestPolicies, ORDERS_GUARD};
+use fixture::{
+    assert_fully_guarded, guard_count, statement_against_the_policy_table, TestPolicies,
+    ORDERS_GUARD,
+};
 use proptest::prelude::*;
 
 /// Task 7.1. `OR 1=1` is the vector that defeats appending `AND <policy>` to the
@@ -192,41 +195,6 @@ fn a_hand_written_lookalike_does_not_pass_for_a_guard() {
 // ---------------------------------------------------------------------------
 // Task 7.7 — property test
 // ---------------------------------------------------------------------------
-
-/// Statement shapes built around the policy table, in every position design D2
-/// claims to cover plus a few it does not.
-fn statement_against_the_policy_table() -> impl Strategy<Value = String> {
-    let relation = prop_oneof![
-        Just("sales.orders".to_string()),
-        Just("sales.orders o".to_string()),
-        Just("orders".to_string()),
-        Just("sales.products p".to_string()),
-        Just("scratch.tmp".to_string()),
-    ];
-    let predicate = prop_oneof![
-        Just(String::new()),
-        Just(" WHERE 1 = 1".to_string()),
-        Just(" WHERE region = 'AMER' OR 1 = 1".to_string()),
-        Just(" WHERE region = 'AMER'".to_string()),
-        Just(" WHERE EXISTS (SELECT 1 FROM sales.orders x WHERE x.id = 1)".to_string()),
-        Just(" WHERE id IN (SELECT id FROM sales.orders)".to_string()),
-    ];
-    let projection = prop_oneof![
-        Just("*".to_string()),
-        Just("COUNT(*)".to_string()),
-        Just("SUM(total)".to_string()),
-        Just("(SELECT MAX(total) FROM sales.orders)".to_string()),
-    ];
-
-    (relation, predicate, projection, 0u8..6).prop_map(|(rel, pred, proj, shape)| match shape {
-        0 => format!("SELECT {proj} FROM {rel}{pred}"),
-        1 => format!("SELECT {proj} FROM (SELECT * FROM {rel}{pred}) d"),
-        2 => format!("SELECT {proj} FROM {rel}{pred} UNION ALL SELECT {proj} FROM sales.orders"),
-        3 => format!("WITH c AS (SELECT * FROM {rel}{pred}) SELECT {proj} FROM c"),
-        4 => format!("SELECT {proj} FROM {rel} LEFT JOIN sales.orders j ON 1 = 1{pred}"),
-        _ => format!("SELECT {proj} FROM sales.orders a JOIN {rel} ON 1 = 1{pred}"),
-    })
-}
 
 proptest! {
     /// Task 7.7. Every generated statement is either refused or reaches Doris
