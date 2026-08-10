@@ -218,6 +218,26 @@ pub fn rewrite_statement(
     // count kept by the code that did the wrapping. If any reference to a
     // policy-bearing table is still reachable outside a guard, the statement
     // does not go out.
+    //
+    // NOT EXERCISED END TO END, AND DELIBERATELY SO. This branch cannot be
+    // reached through `rewrite_statement` while `Wrapper` is correct: the net
+    // only fires when the wrapper has already failed. Replacing this whole
+    // condition with `if false` changes nothing observable in any test, which
+    // mutation testing confirmed.
+    //
+    // The two ways to give it teeth are not equal. Testing
+    // `all_policy_refs_guarded` directly tests the subject of the check rather
+    // than a proxy for it, and `tests/rewrite_verifier.rs` does exactly that —
+    // that file is where this behaviour is pinned, and it is where to add a
+    // case when this logic changes. The alternative, a fault-injection seam
+    // that makes correct wrapping fail on demand, was considered and
+    // **rejected**: it could not be `#[cfg(test)]`-only if an integration test
+    // were to reach it, so it would ship as a switch that disables row
+    // filtering, living inside the control it disables. An untested defensive
+    // branch is a smaller liability than a build that can turn the filter off.
+    //
+    // What is therefore not covered is the *wiring* between wrapper and net,
+    // which is a much narrower claim than the net's own behaviour.
     if !all_policy_refs_guarded(&rewritten, user, current_database, policies)? {
         return Err(RefusalReason::UnsupportedShape {
             construct: "statement whose policy-bearing references could not all be constrained"
@@ -247,20 +267,27 @@ impl SiteVisitor for Wrapper<'_> {
             }
             // No policy for this user and table: left exactly as written.
             PolicyDecision::Unrestricted => Ok(()),
-            // Unreachable: `coverage` refuses the statement before the wrapper
-            // runs. Repeated here so that a future caller reaching the wrapper
-            // by another route still stops rather than silently skipping a
-            // reference it could not resolve.
+            // Unreachable **because `coverage` refuses first**, in
+            // `rewrite_statement` above — not because the case cannot arise.
+            // Its mutant is immortal for that reason: no test can drive this
+            // arm while that pre-check stands. Relax or reorder the
+            // `Coverage::Unresolvable` handling there and this becomes live,
+            // so it is repeated here rather than left to the caller.
             PolicyDecision::Unresolvable => Err(unresolvable_refusal()),
         }
     }
 
     fn visit_write_target(&mut self, _name: &ObjectName) -> AnalysisResult<()> {
-        // Unreachable today: a write touching a policy table is refused before
-        // any wrapping is attempted, and one that touches none is forwarded
-        // without being walked. Refusing rather than returning `Ok` keeps that
-        // true — if a future change routes a write through the wrapper, it stops
-        // here instead of being forwarded with an unwrapped target.
+        // Unreachable **because `rewrite_statement` refuses writes first**: a
+        // write touching a policy table returns `WriteToRestrictedTable` before
+        // any wrapping is attempted, and one touching none is forwarded without
+        // being walked at all. Its mutant is immortal for that reason, not
+        // because returning `Ok` here would be harmless — it would forward a
+        // write with an unwrapped target.
+        //
+        // If write statements are ever brought into scope, this is one of the
+        // places that stops being dead. Do not delete it as unused code; the
+        // reason it is unused lives in another function.
         Err(RefusalReason::UnsupportedShape {
             construct: "write target reached the rewriter".to_string(),
         })
@@ -471,6 +498,18 @@ fn is_guard(query: &Query, cx: Context<'_>) -> bool {
     let TableFactor::Table { name, alias, .. } = relation else {
         return false;
     };
+    // Load-bearing, and more so than it looks: this exit sits *before* the
+    // whole-query comparison below, so accepting an aliased relation here would
+    // wave a subquery through without its predicate ever being checked. A guard
+    // built by `guard` never has an inner alias — the alias moves to the wrapper
+    // — so an alias surviving inside means this was not built by us.
+    //
+    // Deleting the check outright would, by contrast, be **redundant rather
+    // than unnecessary**: the comparison below builds its expected value from
+    // the same relation, so the alias would appear on both sides and cancel,
+    // and only a subquery carrying the correct predicate would still be
+    // accepted. That equivalence holds *given* the comparison. Weaken the
+    // comparison and this check is live again.
     if alias.is_some() {
         return false;
     }
