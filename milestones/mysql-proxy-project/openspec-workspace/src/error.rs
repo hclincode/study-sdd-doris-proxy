@@ -61,6 +61,34 @@ pub enum RefusalReason {
     #[error("statements that read a restricted table into session state are not permitted")]
     RestrictedTableIntoSessionState,
 
+    /// Rewriting the statement would have discarded a `/*!NNNNN … */` version
+    /// gate, so it is refused rather than rewritten.
+    ///
+    /// MySQL runs a gate's contents only when the server is at least version
+    /// `NNNNN` — a question about the backend that only the backend can answer.
+    /// `sqlparser` parses the contents as ordinary SQL and drops the gate, so
+    /// re-rendering emits the fragment unconditionally: the proxy would have
+    /// answered that question on the backend's behalf, always "yes".
+    ///
+    /// Named for the mechanism, not the syntax. The hazard is **rewriting**, not
+    /// executable comments — the identical statement is forwarded byte for byte
+    /// when it needs no rewrite, which is what keeps `mysqldump` working. A name
+    /// like "executable comment not supported" would invite someone to widen
+    /// this into a blanket refusal and break that.
+    ///
+    /// Wording of its own is deliberate, and the reasoning differs from
+    /// [`Self::UnresolvableTableReference`]: the client wrote the comment, so
+    /// naming it discloses nothing the client does not already know, and the
+    /// same policy-bearing inference is already available from
+    /// [`Self::WriteToRestrictedTable`]. Against that, a `mysqldump` user who is
+    /// told only "unsupported construct" will spend an afternoon on their SQL
+    /// rather than on the comment.
+    #[error(
+        "this statement cannot be rewritten without discarding a version-gated \
+         comment, so it was refused rather than altered"
+    )]
+    RewriteWouldDiscardVersionGate,
+
     #[error("multiple statements per request are not permitted")]
     MultiStatement,
 

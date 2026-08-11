@@ -213,11 +213,80 @@ impl StatementKind {
 /// reference in it enumerated.
 #[derive(Clone, Debug)]
 pub struct Analysis {
-    /// The parsed statement, owned so the rewriter can mutate it in place.
-    pub statement: Statement,
+    /// The parsed statement.
+    ///
+    /// **Private on purpose.** The only way to obtain rendered SQL from it is
+    /// [`Analysis::render_rewritten`], which enforces the executable-comment
+    /// invariant. Were this `pub`, `analysis.statement.to_string()` would be an
+    /// unchecked path to rendered text, and it would be reachable forever after
+    /// by anyone who needed the AST for an unrelated reason.
+    statement: Statement,
+    /// Whether the original text carried a `/*! … */` gate. Recorded at analysis
+    /// time because the rendered AST no longer contains it — that is the whole
+    /// hazard.
+    contains_executable_comment: bool,
     pub kind: StatementKind,
     /// Every table reference in the statement, in walk order.
     pub tables: Vec<TableRef>,
+}
+
+impl Analysis {
+    /// Walk the statement, optionally mutating it in place.
+    ///
+    /// The `Statement` never leaves this type, so there is no path from here to
+    /// rendered text that skips [`Analysis::render_rewritten`].
+    pub fn walk_with<V: SiteVisitor>(&mut self, v: &mut V) -> AnalysisResult<()> {
+        walk_statement(&mut self.statement, v)
+    }
+
+    /// Render the (possibly rewritten) statement, or refuse.
+    ///
+    /// # The hazard this exists to prevent
+    ///
+    /// MySQL runs the contents of `/*!NNNNN … */` only when the server version
+    /// is at least `NNNNN`. **That is a question about the backend, and only the
+    /// backend can answer it.** `sqlparser` parses the contents as ordinary SQL
+    /// and discards the gate, so re-rendering the AST emits the fragment
+    /// unconditionally — the proxy would have answered that question on the
+    /// backend's behalf, and answered it "yes" regardless of the truth.
+    /// Measured, before this was closed:
+    ///
+    /// ```text
+    /// in   SELECT /*!99999 id, */ region FROM sales.orders
+    /// out  SELECT id, region FROM (SELECT * FROM sales.orders WHERE …) AS orders
+    /// ```
+    ///
+    /// One column became two, and a gated `UNION` branch became an
+    /// unconditional one — invariant 4 and the column-shape scenario, both
+    /// violated, by a statement the backend might never have run.
+    ///
+    /// # The invariant
+    ///
+    /// **A statement containing an executable comment is either forwarded
+    /// verbatim or refused. It is never rewritten.** Forwarding the original
+    /// text preserves the gate exactly, so the backend still decides; only
+    /// re-rendering destroys it. That asymmetry is the whole of the rule, and it
+    /// is why the check lives here — at the one place rendered text is produced
+    /// — rather than at parse time, where it also refused statements that would
+    /// have been forwarded untouched.
+    ///
+    /// # Why analysing the gated content is safe
+    ///
+    /// The walk sees the fragment *as if it always executes*, which is a
+    /// superset of what may run. Measured:
+    /// `SELECT * FROM sales.products /*! UNION SELECT * FROM sales.orders */`
+    /// enumerates **both** tables. So a gated reference to a policy table is
+    /// caught and refused even when the gate would have skipped it —
+    /// conservative in the safe direction. Were `sqlparser` instead to treat
+    /// `/*! … */` as an ordinary comment and skip its contents, this reasoning
+    /// would collapse, because content executing on Doris would be invisible to
+    /// the walk. It does not; that measurement is load-bearing.
+    pub fn render_rewritten(&self) -> AnalysisResult<String> {
+        if self.contains_executable_comment {
+            return unsupported("conditionally-executed comment");
+        }
+        Ok(self.statement.to_string())
+    }
 }
 
 /// Parse exactly one statement.
@@ -235,9 +304,6 @@ pub struct Analysis {
 /// rejection of the most ordinary thing a client sends. Pinned by
 /// `a_trailing_semicolon_is_not_a_second_statement` in `tests/analyze_walk.rs`.
 pub fn parse_single(sql: &str) -> AnalysisResult<Statement> {
-    if contains_executable_comment(sql) {
-        return unsupported("conditionally-executed comment");
-    }
     let mut statements =
         Parser::parse_sql(&MySqlDialect {}, sql).map_err(|_| RefusalReason::Unparseable)?;
     match statements.len() {
@@ -398,6 +464,7 @@ pub fn analyze(sql: &str) -> AnalysisResult<Analysis> {
     walk_statement(&mut statement, &mut collector)?;
     Ok(Analysis {
         statement,
+        contains_executable_comment: contains_executable_comment(sql),
         kind,
         tables: collector.tables,
     })

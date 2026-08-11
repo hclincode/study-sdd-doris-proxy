@@ -364,39 +364,38 @@ fn a_trailing_semicolon_is_not_a_second_statement() {
 // Executable comments
 // ---------------------------------------------------------------------------
 
-/// Spec: "A statement whose execution depends on the backend's identity is
-/// refused".
+/// A gated fragment is **analysed as if it always executes**, which is a
+/// superset of what may run — and that is what makes forwarding the ungated
+/// cases safe.
 ///
-/// `sqlparser` parses the contents of `/*!NNNNN ... */` as ordinary SQL and
-/// throws the version gate away. The fragment is therefore enumerated and
-/// constrained — but re-rendering the AST emits it *ungated*, so the statement
-/// reaching Doris runs unconditionally what the original might never have run.
-/// Measured before this refusal existed:
+/// The refusal itself no longer lives here. It moved to `Analysis::render_
+/// rewritten`, the one place rendered text is produced, because the hazard is
+/// re-rendering the gate rather than the gate existing: a statement forwarded
+/// verbatim keeps it intact. See `tests/analyze_comment_scanner.rs` for the
+/// invariant.
 ///
-/// ```text
-/// in   SELECT /*!99999 id, */ region FROM sales.orders
-/// out  SELECT id, region FROM (SELECT * FROM sales.orders WHERE `region` IN (…)) AS orders
-/// ```
-///
-/// One column became two, which is the "Column shape is unchanged by rewriting"
-/// scenario violated, and a gated `UNION` branch became unconditional, which is
-/// invariant 4 violated.
+/// What analysis owes is that the gated content is *seen*. If `sqlparser` ever
+/// skipped it instead of parsing it, a gated read of a policy table would be
+/// invisible to the walk and every downstream decision would be made on a
+/// statement the proxy had not actually read.
 #[test]
-fn a_conditionally_executed_comment_is_refused() {
-    for sql in [
-        "SELECT /*!99999 id, */ region FROM sales.orders",
-        "SELECT /*!50000 1, */ * FROM sales.orders",
-        "SELECT * FROM sales.products /*! UNION SELECT * FROM sales.orders */",
-        "SELECT * FROM sales.products /*!99999 UNION SELECT * FROM sales.orders */",
-        "/*!50000 SELECT * FROM sales.orders */",
-        "SELECT * FROM /*! sales.orders */",
-    ] {
-        let reason = refusal(sql);
-        let RefusalReason::UnsupportedShape { construct } = &reason else {
-            panic!("{sql:?} should refuse as an unsupported shape, got {reason:?}");
-        };
-        assert_eq!(construct, "conditionally-executed comment", "for {sql:?}");
-    }
+fn a_conditionally_executed_comment_is_analysed_as_if_it_always_executes() {
+    // The reference inside the gate is enumerated, exactly as if it were
+    // written outside one.
+    assert_eq!(
+        enumerated("SELECT * FROM sales.products /*!99999 UNION SELECT * FROM sales.orders */"),
+        ["sales.products", "sales.orders"]
+    );
+    assert_eq!(
+        enumerated("/*!50000 SELECT * FROM sales.orders */"),
+        ["sales.orders"]
+    );
+    // And a gate over no table enumerates nothing, so nothing downstream will
+    // treat it as restricted.
+    assert!(analyze("/*!40100 SET @@SQL_MODE='' */")
+        .unwrap()
+        .tables
+        .is_empty());
 }
 
 /// The refusal is about the *gate*, not about comments. An ordinary comment is
@@ -443,17 +442,23 @@ fn a_marker_inside_a_literal_is_not_a_conditionally_executed_comment() {
 }
 
 /// `--` begins a comment only when whitespace follows, which is MySQL's rule.
-/// Treating it as a comment unconditionally would skip the rest of the line and
-/// step straight over the marker in the first case here.
+/// Treating it as a comment unconditionally would skip the rest of the line —
+/// stepping over the gate in the first case here, and with it the reference the
+/// gate contains.
+///
+/// Asserted through the enumeration now that the refusal has moved: if the
+/// scanner mis-read `1--2` as starting a comment, `sales.orders` inside the gate
+/// would never be seen, and a statement reading it would be judged unrestricted.
 #[test]
-fn a_marker_after_a_double_minus_operator_is_still_detected() {
+fn a_gate_after_a_double_minus_operator_is_still_seen() {
     for sql in [
         "SELECT 1--2 /*!99999 UNION SELECT * FROM sales.orders */",
         "SELECT 1-- comment\n/*!99999 UNION SELECT * FROM sales.orders */",
     ] {
-        assert!(
-            matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
-            "{sql:?} should be refused"
+        assert_eq!(
+            enumerated(sql),
+            ["sales.orders"],
+            "{sql:?} — the reference inside the gate must be enumerated"
         );
     }
 }

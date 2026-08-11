@@ -271,9 +271,15 @@ pub fn rewrite_statement(
     }
 
     let mut wrapper = Wrapper { cx };
-    walk_statement(&mut analysis.statement, &mut wrapper)?;
+    analysis.walk_with(&mut wrapper)?;
 
-    let rewritten = analysis.statement.to_string();
+    // The only place an analysed statement is rendered back to text, which is
+    // why the executable-comment check lives inside `render_rewritten` rather
+    // than here. Re-rendering discards a `/*!NNNNN */` gate — a question only
+    // the backend can answer — so the check belongs where rendering happens,
+    // not where someone has to remember to call it. `Analysis::statement` is
+    // private for the same reason: this line cannot be written any other way.
+    let rewritten = analysis.render_rewritten()?;
 
     // Task 5.3. An independent re-analysis of the *rendered* output, not a
     // count kept by the code that did the wrapping. If any reference to a
@@ -606,6 +612,15 @@ fn is_guard(query: &Query, cx: Context<'_>) -> bool {
         return false;
     };
 
+    // The fifth `to_string()` in this file, and the only one that is **not** a
+    // render of user SQL — which is why the executable-comment check in
+    // `Analysis::render_rewritten` does not apply to it and must not be added
+    // here. `expected` is a `Query` this module just constructed from a cloned
+    // relation, rendered solely to normalise it for the equality comparison
+    // below, and never forwarded. A `/*!NNNNN */` gate cannot be lost from it
+    // because comments are not AST nodes: there was never one in this tree to
+    // discard. Noted so an audit of "where do we render?" resolves here instead
+    // of re-deriving it.
     let expected = guard_query(relation.clone(), policy);
     let Ok(Statement::Query(normalised)) = crate::analyze::parse_single(&expected.to_string())
     else {

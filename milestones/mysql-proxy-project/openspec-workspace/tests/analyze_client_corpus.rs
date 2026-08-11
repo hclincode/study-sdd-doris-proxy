@@ -222,31 +222,66 @@ const CORPUS: &[Entry] = &[
     // in the corpus so the cost is visible and so a later `sqlparser` upgrade
     // that fixes one turns this test red and forces a decision, rather than
     // quietly widening what is accepted.
-    failing(
+    // Reclassified from `failing` to `ok` deliberately, in the change that made
+    // it true — not as later maintenance.
+    //
+    // These carry a `/*!NNNNN */` gate, and they read no policy table, so they
+    // are **forwarded verbatim with the gate intact** rather than rewritten.
+    // The 10.6 hazard was never the comment; it was re-rendering the AST, which
+    // discards a condition only the backend can evaluate. Forward-verbatim does
+    // not re-render, so the hazard is absent. See
+    // `tests/analyze_comment_scanner.rs`.
+    ok(
         "/*!40100 SET @@SQL_MODE='' */",
         Source::Measured,
         "mysqldump 8.x, first statement",
-        "10.6 — executable comment; the version gate is resolved on the backend's \
-         behalf when the AST is re-rendered, so these are refused",
     ),
-    failing(
+    ok(
         "/*!40103 SET TIME_ZONE='+00:00' */",
         Source::Measured,
         "mysqldump 8.x, second statement",
-        "10.6 — executable comment",
     ),
-    failing(
+    ok(
         "/*!80000 SET SESSION information_schema_stats_expiry=0 */",
         Source::Measured,
         "mysqldump 8.x, third statement",
-        "10.6 — executable comment",
     ),
+    // The measured form, which is not the one I first recorded: the
+    // `WITH CONSISTENT SNAPSHOT` is itself inside a gate. Captured from
+    // `mysqldump`'s own error quoting the statement it sent. `sqlparser` parses
+    // the gate contents, so this is equivalent to
+    // `START TRANSACTION WITH CONSISTENT SNAPSHOT`, which it cannot parse.
     failing(
-        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
-        Source::Documented,
+        "START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */",
+        Source::Measured,
         "mysqldump --single-transaction",
         "10.7 — `MySqlDialect` cannot parse it; a parser gap, not an allowlist \
          gap, so no classification work fixes it",
+    ),
+    // Where plain `mysqldump` stops once the gates are forwarded. Observed
+    // end-to-end against the live Doris; the statement text is `mysqldump`'s
+    // documented form rather than one I captured, since it never reaches a
+    // sniffer that cannot return result sets.
+    failing(
+        "LOCK TABLES `orders` READ /*!32311 LOCAL */",
+        Source::Documented,
+        "mysqldump without --single-transaction",
+        "10.9/10.11 — `LOCK TABLES` is an unclassified statement kind, so it \
+         refuses at classification without the walk ever being asked. It names \
+         a table and reads no row, so the default change should decide it",
+    ),
+    failing(
+        "UNLOCK TABLES",
+        Source::Documented,
+        "mysqldump, after dumping",
+        "10.9/10.11 — unclassified kind, and the other half of a pair: a client \
+         allowed to LOCK must be allowed to UNLOCK",
+    ),
+    failing(
+        "SHOW CREATE DATABASE `sales`",
+        Source::Documented,
+        "mysqldump --databases, DBeaver",
+        "10.7 — `MySqlDialect` cannot parse it",
     ),
     failing(
         "COMMIT RELEASE",
