@@ -31,8 +31,8 @@ use sqlparser::ast::{
 };
 
 use crate::analyze::{
-    analyze, relation_table_ref, walk_statement, AnalysisResult, SiteVisitor, StatementKind,
-    TableName, TableRef,
+    analyze, relation_table_ref, walk_statement, AnalysisResult, RefPosition, SiteVisitor,
+    StatementKind, TableName, TableRef,
 };
 use crate::error::RefusalReason;
 use crate::policy::{
@@ -110,6 +110,17 @@ impl<'a> Context<'a> {
     /// either. Every relation its body reads was constrained at its own site.
     fn decide_site(&self, table: &TableRef) -> PolicyDecision<'a> {
         if table.is_cte_reference {
+            return PolicyDecision::Unrestricted;
+        }
+        // A statement that only *names* a table reads no row from it, so no
+        // policy applies to that reference. This is where the spec's
+        // reads-versus-names line is drawn, and drawing it here rather than at
+        // disposition is what keeps it correct: by the time a statement kind is
+        // being dispatched, a flat list of references no longer records which
+        // were reads. `SHOW COLUMNS FROM sales.orders` is unrestricted;
+        // `SHOW VARIABLES WHERE (SELECT … FROM sales.orders) = 5` is not,
+        // because its subquery reference is a `Relation`.
+        if table.position == RefPosition::Named {
             return PolicyDecision::Unrestricted;
         }
         self.decide_name(&table.name)
@@ -231,38 +242,30 @@ pub fn rewrite_statement(
         // not bound what the client can read, so refusing is the honest answer.
         StatementKind::Session => return Err(RefusalReason::RestrictedTableIntoSessionState),
 
-        // **Refused, pending provenance in the enumeration.** The spec says a
-        // metadata statement that merely *names* a policy table forwards, since
-        // the same names are reachable through `information_schema`, which
-        // carries no policy. That is still the intent — but it is not a rule
-        // this arm can currently implement, and forwarding was a live
-        // disclosure.
+        // Reached **only when a policy-bearing reference was not a naming one**
+        // — so this is a metadata statement that *reads* a restricted table,
+        // and it is refused.
         //
-        // `Analysis` gives a flat list of table references with no record of
-        // *why* each was enumerated, so these two are indistinguishable here:
+        // A statement that merely names the table never arrives here:
+        // `RefPosition::Named` is treated as unrestricted in `decide_site`, so
+        // `SHOW COLUMNS FROM sales.orders` forwards by the ordinary
+        // `Coverage::Unrestricted` path. What is left is the shape that made
+        // this arm a live disclosure when it forwarded unconditionally:
         //
-        //     SHOW COLUMNS FROM sales.orders                     -- names it
         //     SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5
         //
-        // The second evaluates a subquery against the table and reports the
-        // answer through whether any row comes back — an oracle that yields the
-        // true row count, and arbitrary values a bit at a time. Confirmed
-        // against a real Doris: a user restricted to 3 of 5 rows read the 5.
+        // The filter evaluates a subquery against the table and answers through
+        // whether any row comes back — an oracle yielding the true row count,
+        // and arbitrary values a bit at a time. Confirmed against a real Doris:
+        // a user restricted to 3 of 5 rows read the 5. `tests/rewrite_rejections.rs`
+        // has the regression test; do not weaken this arm without reading it.
         //
-        // Refusing here closes it and costs only metadata *about policy tables*:
-        // `SHOW TABLES`, `SHOW DATABASES`, `SHOW VARIABLES` and every statement
-        // a connector sends touch no policy table, so they never reach this arm
-        // — they are forwarded by the `Coverage::Unrestricted` path above. This
-        // is not a blanket refusal of metadata statements.
-        //
-        // Restore the forwarding rule once `RefPosition` distinguishes a
-        // name-position reference from an expression-position one: forward when
-        // *every* policy-bearing reference is name-position, refuse if any is
-        // expression-position. The regression test for the oracle must keep
-        // passing when that lands.
+        // Wrapping is not an option even in principle: the subquery's result
+        // reaches the client through the *presence* of metadata rows, not
+        // through a row set whose contents a guard could bound.
         StatementKind::Metadata => {
             return Err(RefusalReason::UnsupportedShape {
-                construct: "metadata statement referencing a restricted table".to_string(),
+                construct: "metadata statement reading a restricted table".to_string(),
             })
         }
     }
@@ -333,6 +336,18 @@ impl SiteVisitor for Wrapper<'_> {
             // so it is repeated here rather than left to the caller.
             PolicyDecision::Unresolvable => Err(unresolvable_refusal()),
         }
+    }
+
+    fn visit_named(&mut self, _name: &ObjectName) -> AnalysisResult<()> {
+        // Unreachable **because `rewrite_statement`'s kind match returns before
+        // the wrapper runs** for every kind that can name a table: `Metadata`
+        // and `Session` never reach `Wrapper`, and a `SELECT` has no naming
+        // position. Refusing rather than returning `Ok` keeps that true — a
+        // named reference cannot be wrapped, so if one ever arrives here the
+        // statement must stop rather than be forwarded with it unconstrained.
+        Err(RefusalReason::UnsupportedShape {
+            construct: "named table reached the rewriter".to_string(),
+        })
     }
 
     fn visit_write_target(&mut self, _name: &ObjectName) -> AnalysisResult<()> {
@@ -517,6 +532,16 @@ impl SiteVisitor for Verifier<'_> {
         if !self.cx.decide_name(&table).is_unrestricted() {
             self.unguarded = true;
         }
+        Ok(())
+    }
+
+    fn visit_named(&mut self, _name: &ObjectName) -> AnalysisResult<()> {
+        // Not flagged, and this is the one place in the verifier where *not*
+        // flagging is right. A guard constrains the rows a reference yields; a
+        // named table yields none, so there is nothing for a guard to do and its
+        // absence is not a gap. Flagging here would make every `SHOW COLUMNS`
+        // fail verification and be refused — the compatibility loss the spec
+        // rules out, for no confidentiality gained.
         Ok(())
     }
 

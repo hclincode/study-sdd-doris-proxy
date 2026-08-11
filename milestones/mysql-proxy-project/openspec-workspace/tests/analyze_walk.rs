@@ -259,6 +259,10 @@ fn an_unlisted_node_kind_cannot_analyse_rather_than_enumerating_nothing() {
             self.seen += 1;
             Ok(())
         }
+        fn visit_named(&mut self, _: &ObjectName) -> AnalysisResult<()> {
+            self.seen += 1;
+            Ok(())
+        }
     }
 
     let mut statement = statement_selecting_from(TableFactor::UNNEST {
@@ -849,50 +853,74 @@ fn a_metadata_statement_listing_objects_enumerates_nothing() {
     }
 }
 
-/// Spec: "A metadata statement naming a policy table is forwarded".
+/// Spec: "A metadata statement naming a policy table is forwarded" — and the
+/// provenance that makes it safe to forward.
 ///
-/// The name is deliberately **not** enumerated, so the statement is never
-/// refused for naming a policy-bearing table. Refusing would protect nothing:
-/// the same column list is reachable through `information_schema.columns`,
-/// which carries no policy and is forwarded, so the information is one `SELECT`
-/// away either way — and two paths to the same metadata disagreeing is worse
-/// than either answer.
+/// The name **is** enumerated, tagged [`RefPosition::Named`]. That matters more
+/// than the forwarding does. An earlier version expressed "names are forwarded"
+/// by not enumerating the name at all, which put a disposition decision inside
+/// the analyser and broke invariant 6 — and, because the two cases then looked
+/// identical downstream, left `SHOW VARIABLES WHERE (SELECT COUNT(*) FROM
+/// sales.orders) = 5` forwarded as though it merely named the table. That is a
+/// bit-at-a-time oracle over restricted rows.
 ///
-/// The line the spec draws is **reads versus names**, and this is the naming
-/// side of it.
+/// Enumerate everything; tag why it is there; let the disposition layer decide.
 #[test]
-fn a_metadata_statement_naming_a_policy_table_enumerates_nothing() {
+fn a_metadata_statement_naming_a_policy_table_enumerates_it_as_named() {
     for sql in [
         "SHOW COLUMNS FROM sales.orders",
         "SHOW FULL COLUMNS FROM sales.orders",
         "SHOW CREATE TABLE sales.orders",
         "SHOW CREATE VIEW sales.orders",
-        "SHOW INDEX FROM sales.orders",
-        "SHOW KEYS FROM sales.orders",
     ] {
         let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
         assert_eq!(analysis.kind, StatementKind::Metadata, "for {sql:?}");
-        assert!(
-            analysis.tables.is_empty(),
-            "{sql:?} enumerated {:?}; naming a table is not reading it",
-            analysis.tables
+        assert_eq!(
+            analysis
+                .tables
+                .iter()
+                .map(|t| (t.name.to_string(), t.position))
+                .collect::<Vec<_>>(),
+            [("sales.orders".to_string(), RefPosition::Named)],
+            "for {sql:?}"
         );
+    }
+
+    // A database after `FROM` is not a table, and must not be enumerated as one
+    // — a policy on `sales.orders` must not be matched by `SHOW TABLES FROM
+    // sales`.
+    for sql in ["SHOW TABLES FROM sales", "SHOW DATABASES"] {
+        let analysis = analyze(sql).unwrap();
+        assert!(analysis.tables.is_empty(), "{sql:?} enumerated a table");
     }
 }
 
-/// The other side of that line. A metadata statement can still carry an
-/// *expression*, and an expression can carry a subquery that reads rows — so
-/// the clauses that are expressions are walked even though the named object is
-/// not.
+/// The oracle, pinned at the layer where it was lost.
 ///
-/// Neither of us anticipated this shape; routing `SHOW` through the same walk as
-/// everything else caught it without anyone having to think of it.
+/// `SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5` returns rows
+/// only when the count is 5, so a restricted user can test any predicate about
+/// rows they cannot see, one bit at a time. The reference must be enumerated as
+/// a **`Relation`** — a read — not as a name, or the disposition layer has no
+/// way to tell it from `SHOW COLUMNS`.
 #[test]
-fn a_metadata_statement_reading_a_table_in_a_predicate_enumerates_it() {
-    assert_eq!(
-        tables_of("SHOW VARIABLES WHERE Variable_name IN (SELECT region FROM sales.orders)"),
-        ["sales.orders"]
-    );
+fn a_metadata_statement_reading_a_policy_table_enumerates_it_as_a_relation() {
+    for sql in [
+        "SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5",
+        "SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders WHERE total > 400) = 1",
+        "SHOW STATUS WHERE (SELECT MAX(total) FROM sales.orders) > 400",
+        "SHOW VARIABLES WHERE Variable_name IN (SELECT region FROM sales.orders)",
+    ] {
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert_eq!(
+            analysis
+                .tables
+                .iter()
+                .map(|t| (t.name.to_string(), t.position))
+                .collect::<Vec<_>>(),
+            [("sales.orders".to_string(), RefPosition::Relation)],
+            "for {sql:?} — a read must not be enumerated as a name"
+        );
+    }
 }
 
 /// `sqlparser` parks the `SHOW` forms it does not model in `ShowVariable` as raw

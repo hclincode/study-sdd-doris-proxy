@@ -249,6 +249,30 @@ disables. Testing `all_policy_refs_guarded` directly tests the subject of the
 check rather than a proxy for it; what is forgone is confidence in the *wiring*
 between wrapper and net, a much narrower claim than the net's behaviour.
 
+### Running it is necessary, not sufficient: measure the build you changed
+
+The section above concludes that reasoning about unreachability was unreliable and
+that running the thing was the only consistently correct method. That needs one
+qualification, learned the same day: **running it against a stale artifact is a
+way of being confidently wrong with evidence in hand.**
+
+A fix landed in `src/rewrite.rs` closing a confirmed disclosure oracle. The
+re-measurement against the live Doris still showed the oracle returning rows —
+because the proxy under test was a binary started *before* the change. The
+measurement was real, the reasoning from it was sound, and the conclusion was
+false, because the artifact was not the one that had been fixed.
+
+This is the same family as the three stale-state errors elsewhere in this change:
+an agent's file read after another agent had already fixed it, a mutation report
+read after the code under it moved, and a test suite whose result was committed
+without being read. In each the information was accurate about *something* — just
+not about the thing being reasoned over.
+
+The operational rule: **rebuild before measuring**, and when a measurement
+contradicts a change you believe you made, suspect the artifact before suspecting
+the change. A green run and a red run are equally worthless if neither is of the
+code in front of you.
+
 ## The recurring defect: a test double's shape bounds what can ever be tested
 
 Three times in this change, a gap was invisible from inside the tests because

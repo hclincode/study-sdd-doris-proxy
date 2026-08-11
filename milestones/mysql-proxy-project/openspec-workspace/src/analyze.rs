@@ -108,15 +108,34 @@ impl fmt::Display for TableName {
     }
 }
 
-/// Where in the statement a table reference sits.
+/// Where in the statement a table reference sits — and, crucially, whether the
+/// statement **reads** the table's rows or merely **names** it.
+///
+/// That distinction is the one `specs/row-filter-rewrite` draws for metadata
+/// statements, and it has to survive enumeration or the disposition layer cannot
+/// apply it. It did not, once, and the result was a live disclosure hole:
+/// `SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5` returns rows
+/// only when the count is 5, so a restricted user can test any predicate over
+/// rows they may not see, one bit at a time. The reference was enumerated
+/// correctly; what was lost was *why* it was there, leaving a metadata statement
+/// that names a table indistinguishable from one that reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefPosition {
-    /// A relation in a `FROM` or join position. The only position a derived-table
-    /// wrap (design D2) can be applied to.
+    /// A relation in a `FROM` or join position — its rows flow into the result.
+    /// The only position a derived-table wrap (design D2) can be applied to.
     Relation,
     /// The target of a write statement. Enumerated so a policy can be detected,
     /// never wrapped — writes against policy tables are refused outright.
     WriteTarget,
+    /// The statement **names** this table to describe it, and does not read a
+    /// row from it: `SHOW COLUMNS FROM sales.orders`, `SHOW CREATE TABLE …`.
+    ///
+    /// Forwarding these is deliberate and measured, not an oversight — the same
+    /// metadata is reachable through `information_schema`, which carries no
+    /// policy, so refusing would cost compatibility and withhold nothing. But
+    /// that argument holds *only* for naming. A reference in any other position
+    /// inside the same statement is a read, and must be treated as one.
+    Named,
 }
 
 /// One enumerated reference to a named relation.
@@ -449,6 +468,16 @@ impl SiteVisitor for Collector {
         });
         Ok(())
     }
+
+    fn visit_named(&mut self, name: &ObjectName) -> AnalysisResult<()> {
+        self.tables.push(TableRef {
+            name: TableName::from_object_name(name)?,
+            alias: None,
+            is_cte_reference: false,
+            position: RefPosition::Named,
+        });
+        Ok(())
+    }
 }
 
 /// Describe a `TableFactor::Table` site as a [`TableRef`].
@@ -483,6 +512,14 @@ pub trait SiteVisitor {
 
     /// The target of a write statement.
     fn visit_write_target(&mut self, name: &ObjectName) -> AnalysisResult<()>;
+
+    /// A table the statement *names* to describe, without reading its rows.
+    ///
+    /// Deliberately has **no default implementation**. A default would silently
+    /// do nothing for every existing visitor, which is exactly how the
+    /// distinction went missing the first time; making it a compile error forces
+    /// each visitor to say what it does with a named table.
+    fn visit_named(&mut self, name: &ObjectName) -> AnalysisResult<()>;
 
     /// Called before descending into a derived table. Returning `false` skips
     /// the subquery — used by the post-rewrite verification to stop at a guard
@@ -524,19 +561,26 @@ pub fn walk_statement<V: SiteVisitor>(statement: &mut Statement, v: &mut V) -> A
         // Snowflake field that `MySqlDialect` always leaves `None`. So the
         // statement kind is the only thing that says whether that name is a
         // table, and it is passed in explicitly rather than sniffed.
-        Statement::ShowColumns { show_options, .. }
-        | Statement::ShowTables { show_options, .. }
+        // The name after `FROM`/`IN` is a *table* for `SHOW COLUMNS` and a
+        // *database* for the listing forms. `ShowStatementOptions` does not
+        // record which — `parent_type` is a Snowflake field `MySqlDialect`
+        // always leaves `None` — so the statement kind is the only thing that
+        // knows, and it is passed in rather than sniffed.
+        Statement::ShowColumns { show_options, .. } => {
+            walk_show_options(show_options, NameIsTable::Yes, &mut scope, v)
+        }
+        Statement::ShowTables { show_options, .. }
         | Statement::ShowDatabases { show_options, .. }
         | Statement::ShowSchemas { show_options, .. }
         | Statement::ShowViews { show_options, .. } => {
-            walk_show_options(show_options, &mut scope, v)
+            walk_show_options(show_options, NameIsTable::No, &mut scope, v)
         }
         Statement::ShowVariables { filter, .. }
         | Statement::ShowStatus { filter, .. }
         | Statement::ShowCollation { filter } => walk_show_filter(filter.as_mut(), &mut scope, v),
         Statement::ShowCharset(show) => walk_show_filter(show.filter.as_mut(), &mut scope, v),
         Statement::ShowVariable { variable } => walk_show_variable(variable),
-        Statement::ShowCreate { obj_type, obj_name } => walk_show_create(obj_type, obj_name),
+        Statement::ShowCreate { obj_type, obj_name } => walk_show_create(obj_type, obj_name, v),
         // Transaction control. Every one of these variants carries only enums
         // and identifiers — isolation levels, access modes, a savepoint name —
         // and no `Expr`, so none of them can reference a table at all.
@@ -603,29 +647,46 @@ fn walk_set<V: SiteVisitor>(
     }
 }
 
-/// Walk the parts of a `SHOW` that can *read* rows, and deliberately not the
-/// object it names.
+/// Whether the name after `FROM`/`IN` in a `SHOW` denotes a table or a database.
 ///
-/// The distinction is the rule in `specs/row-filter-rewrite`: a statement that
-/// **reads** a policy table's rows is refused, one that merely **names** it to
-/// report metadata is forwarded. `show_in.parent_name` is a name — the table in
-/// `SHOW COLUMNS FROM sales.orders`, the database in `SHOW TABLES FROM sales` —
-/// and it is not enumerated, so neither statement is refused.
+/// `SHOW COLUMNS FROM sales.orders` names a table; `SHOW TABLES FROM sales`
+/// names a database. Enumerating a database as a table would ask the policy
+/// layer the wrong question, and a policy on `sales.orders` must not be matched
+/// by `SHOW TABLES FROM sales`.
+#[derive(Clone, Copy, PartialEq)]
+enum NameIsTable {
+    Yes,
+    No,
+}
+
+/// Walk a `SHOW`, enumerating both what it *names* and what it *reads* — and
+/// distinguishing them, because the disposition differs.
 ///
-/// **Refusing them would protect nothing.** The same column list is reachable
-/// through `information_schema.columns`, which carries no policy and is
-/// forwarded, so a refusal would cost compatibility while leaving the
-/// information one `SELECT` away — and two paths to the same metadata
-/// disagreeing is worse than either answer. Metadata disclosure is a documented
-/// accepted limitation of this control.
+/// The named table is reported through [`SiteVisitor::visit_named`], so a
+/// metadata statement that merely describes a policy table can be forwarded.
+/// The `limit` and `filter` clauses are **expressions**, walked like any other:
+/// an expression can carry a subquery, and a subquery reads rows.
 ///
-/// The `limit` and `filter` clauses *are* walked: they are expressions, and an
-/// expression can carry a subquery that reads rows.
+/// An earlier version expressed "names are forwarded" by simply *not
+/// enumerating* the name. That put a disposition decision inside the analyser,
+/// broke invariant 6 — every table reference enumerated — and left the two cases
+/// indistinguishable downstream, which is what allowed
+/// `SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5` to be
+/// forwarded as though it merely named the table. Enumerate everything; let the
+/// disposition layer decide.
 fn walk_show_options<V: SiteVisitor>(
     options: &mut sqlparser::ast::ShowStatementOptions,
+    names_a_table: NameIsTable,
     scope: &mut CteScope,
     v: &mut V,
 ) -> AnalysisResult<()> {
+    if names_a_table == NameIsTable::Yes {
+        if let Some(show_in) = &options.show_in {
+            if let Some(parent_name) = &show_in.parent_name {
+                v.visit_named(parent_name)?;
+            }
+        }
+    }
     if let Some(limit) = &mut options.limit {
         walk_expr(limit, scope, v)?;
     }
@@ -680,17 +741,25 @@ fn walk_show_variable(variable: &[Ident]) -> AnalysisResult<()> {
 }
 
 /// `SHOW CREATE TABLE sales.orders` names a table and reads no row from it, so
-/// it is forwarded and the name is not enumerated.
+/// the name is reported as [`RefPosition::Named`] and the statement forwards.
 ///
-/// Its output is the table's definition, which `information_schema` already
-/// discloses to the same user through a path that carries no policy. See
-/// [`walk_show_options`] for the full argument.
-fn walk_show_create(
+/// Reported rather than skipped: the disposition belongs downstream, and
+/// enumerating every reference is invariant 6.
+fn walk_show_create<V: SiteVisitor>(
     obj_type: &sqlparser::ast::ShowCreateObject,
     obj_name: &ObjectName,
+    v: &mut V,
 ) -> AnalysisResult<()> {
-    let _ = (obj_type, obj_name);
-    Ok(())
+    use sqlparser::ast::ShowCreateObject;
+    match obj_type {
+        ShowCreateObject::Table | ShowCreateObject::View => v.visit_named(obj_name),
+        // An event, function, procedure or trigger name is not a table, so there
+        // is nothing here the policy layer could resolve.
+        ShowCreateObject::Event
+        | ShowCreateObject::Function
+        | ShowCreateObject::Procedure
+        | ShowCreateObject::Trigger => Ok(()),
+    }
 }
 
 fn walk_query<V: SiteVisitor>(

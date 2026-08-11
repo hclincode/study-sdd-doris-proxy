@@ -447,30 +447,31 @@ fn a_metadata_statement_cannot_be_used_as_an_oracle_over_a_policy_table() {
     }
 }
 
-/// A metadata statement *naming* a policy table is refused **for now**.
+/// Spec: "A metadata statement naming a policy table is forwarded" — and it
+/// still is, even though the oracle above is refused.
 ///
-/// The spec says it should forward: the same names are reachable through
-/// `information_schema`, which carries no policy, so refusing withholds nothing
-/// and costs clients that introspect. That remains the intent.
+/// The two are separated at **enumeration**, not at disposition. `SHOW COLUMNS
+/// FROM sales.orders` enumerates *no* table at all: `walk_show_options`
+/// deliberately skips the object a `SHOW` names while still walking its `LIMIT`
+/// and filter, because those are expressions and an expression can carry a
+/// subquery that reads rows. So the naming form never looks policy-bearing and
+/// is forwarded by the ordinary unrestricted path, while the oracle form
+/// enumerates `sales.orders` and is refused.
 ///
-/// It cannot be implemented yet. The enumeration records *which* tables a
-/// statement references but not *why*, so this shape and the oracle above are
-/// indistinguishable at the point of decision — and one of them had to be
-/// refused. Fail closed: prefer a false rejection over a false disclosure.
-///
-/// **When `RefPosition` gains name-position versus expression-position, this
-/// test flips back to asserting forwarding** and the oracle test above must
-/// still pass. Both halves are the requirement; neither alone is.
+/// That is why the refusal above costs nothing here: the distinction is made
+/// where the information exists, rather than being reconstructed later from a
+/// flat list that no longer carries it.
 #[test]
-fn a_metadata_statement_naming_a_policy_table_is_refused_pending_provenance() {
+fn a_metadata_statement_naming_a_policy_table_is_forwarded() {
     let session = TestPolicies::analyst();
     for sql in [
         "SHOW COLUMNS FROM sales.orders",
         "SHOW CREATE TABLE sales.orders",
     ] {
-        assert!(
-            session.rewrite(sql).is_err(),
-            "{sql:?} is indistinguishable from an oracle until references carry provenance"
+        assert_eq!(
+            session.rewrite(sql).ok().as_deref(),
+            Some(sql),
+            "{sql:?} names a policy table but reads no rows, so it is forwarded"
         );
     }
 }
