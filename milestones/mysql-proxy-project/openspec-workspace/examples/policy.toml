@@ -1,0 +1,47 @@
+# Row-filtering policy for the Doris proxy.
+#
+# Each `[[policy]]` entry says: this user, reading this table, may see only rows
+# whose `column` value is in `permitted_values`.
+#
+# Rules this file must satisfy, or the proxy refuses to start:
+#
+#   - every field below is required; none may be empty
+#   - `permitted_values` must list at least one value (strings or integers).
+#     An empty list is a configuration error, NOT a policy that permits no rows.
+#   - a user may have at most one policy per table
+#   - unknown keys and unknown sections are refused, so a typo cannot silently
+#     disable filtering
+#
+# A table with no entry here for the requesting user is unrestricted and is
+# forwarded untouched. Absence means "no restriction", not "no access".
+#
+# `database` and `table` are separate fields on purpose: the qualified name is
+# what a policy is matched on, and splitting it removes any question of how a
+# dotted string would be parsed. Database and table names are matched
+# case-insensitively; usernames are matched exactly.
+
+[[policy]]
+user = "analyst"
+database = "sales"
+table = "orders"
+column = "region"
+permitted_values = ["APAC", "EMEA"]
+
+[[policy]]
+user = "auditor"
+database = "sales"
+table = "orders"
+column = "region"
+permitted_values = ["APAC", "EMEA", "AMER"]
+
+# Permitted values may be integers as well as strings.
+[[policy]]
+user = "analyst"
+database = "sales"
+table = "invoices"
+column = "tenant_id"
+permitted_values = [17, 23]
+
+# `reporting` appears nowhere in this file, so every table is unrestricted for
+# that user — and, by design D6, a statement it issues that the proxy cannot
+# parse is forwarded rather than rejected.

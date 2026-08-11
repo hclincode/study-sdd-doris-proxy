@@ -1,7 +1,31 @@
 # Discussion: Proxy scope
 
-**Date:** 2026-08-08 · **Status:** scope stated, boundaries partly open
+**Date:** 2026-08-08 · **Status:** ⏹ **Closed without decision, 2026-08-09**
 **Resolves:** D4 in `01-sdd-tool-selection.md` (partially)
+
+> **⏹ Closed without a decision.** This discussion is over and nothing further
+> will be decided in it. The questions it left open — T1 (whether the proxy is a
+> security boundary), B2 (one FE or several), and the fail-closed-versus-
+> pass-through choice in §1 — were **never resolved here**. They were overtaken
+> when milestone 2 restated the proxy's scope from scratch rather than
+> continuing this thread.
+>
+> Nothing below should be read as a current requirement, including the parts
+> marked "resolved". For current scope see `CLAUDE.md` — Proxy scope, and the
+> change under
+> `milestones/mysql-proxy-project/openspec-workspace/openspec/changes/`.
+>
+> **Correction to the 2026-08-08 banner below.** That banner states that the
+> tenant-isolation analysis "no longer applies" because the rewrite is resource
+> protection rather than a security control. That is no longer true. Milestone 2
+> adopted **row-level filtering by authenticated user**, which is security-
+> relevant, so the isolation reasoning is live again — the `LIMIT 200` scope that
+> displaced it is itself now superseded. Kept as written, because a decision
+> record is history; read the two banners in order.
+>
+> Read for provenance, not direction. Its value is that C1, C2, C3 and T1 were
+> reached independently and largely match what milestone 2 arrived at — see
+> "Where this landed" at the foot of the file.
 
 ## Stated scope
 
@@ -232,3 +256,32 @@ Three honest postures:
 it governs every rewrite rule ever written. Getting this wrong is the difference
 between a spec that describes a security control and one that describes a
 convention.
+
+---
+
+## Where this landed
+
+Recorded 2026-08-09 when this discussion was closed. **This section decides
+nothing.** It is a forwarding address, so a reader who arrives here does not
+mistake open questions for abandoned ones. Every item below was settled
+elsewhere, in milestone 2, and that other artifact is authoritative.
+
+| Item here | Where it was actually settled |
+|---|---|
+| §1 fail closed vs pass through | Fail closed. Milestone 2's scope is security-relevant, so the tension flagged here resolved the way this file warned it would |
+| §1 prefix sniffing as a cheaper option | Not taken — full parse, as C1 predicted would be forced |
+| §2 placeholder-stability invariant | Adopted verbatim as a cross-cutting invariant |
+| §3 `CLIENT_MULTI_STATEMENTS` | Capability negotiated away rather than handled |
+| B1 what the rewriting is for | Restated, not inherited — row-level filtering by authenticated user |
+| B2 one FE or several | Still deferred; single FE assumed |
+| B3 passthrough auth · B5 1:1 connections | Carried forward unchanged |
+| C1 allowlist over statement shapes | Adopted, including the compatibility cost this file said to accept explicitly |
+| C2 dial backend first, relay its salt | Adopted as-is |
+| C3 identity from the username | Adopted as-is |
+| T1 proxy is not a security boundary | Closed as posture 2 — network isolation is an environmental precondition, stated as such rather than implied |
+
+The reason to keep this file: **C1, C2, C3 and T1 were derived here from first
+principles and milestone 2 reached the same answers independently.** That is
+some evidence the reasoning was sound rather than lucky — and it is also a
+reminder that the analysis was available a milestone before it was used, which
+is the more useful lesson.

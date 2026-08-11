@@ -1,0 +1,192 @@
+schema: spec-driven
+
+context: |
+  ## What this is
+
+  An L7 MySQL proxy for Apache Doris, written in Rust. It terminates the MySQL
+  wire protocol (parses it — does not relay bytes), forwards to a Doris FE, and
+  rewrites SQL before it reaches the backend.
+
+  The overriding goal is LEARNING SPEC-DRIVEN DEVELOPMENT. The proxy is the
+  exercise, not the deliverable. Do not optimize the spec ceremony away to ship
+  code faster. Legibility of the method beats efficiency.
+
+  ## The functional requirement
+
+  Row-level filtering by authenticated user. A configuration maps a user and a
+  table to a column and a set of permitted values; the proxy rewrites incoming
+  SQL so that user's queries against that table can only return rows whose
+  column value is in that set. Conceptually the proxy injects
+  `<column> IN (<configured values>)` into the query's WHERE semantics.
+
+  ## THIS IS A SECURITY CONTROL — FAIL CLOSED
+
+  This is the single most important fact about the project, and it inverts the
+  usual proxy trade-off:
+
+  - A statement that does not parse MUST be REJECTED, never forwarded.
+  - A statement that parses into a shape the rewriter cannot prove it has
+    correctly constrained MUST be REJECTED, never forwarded.
+  - A missed filter is a DATA LEAK, not a performance problem. There is no
+    "forward it and see" option anywhere in this design.
+  - `sqlparser` has no Doris dialect, so some valid Doris SQL will not parse.
+    Those statements are rejected. Reduced compatibility is the accepted price
+    of the security property; say so plainly rather than quietly widening the
+    pass-through path.
+
+  Any proposal, design or task that would forward a statement the rewriter did
+  not fully understand is wrong, however convenient. Prefer a false rejection
+  over a false disclosure, every time.
+
+  ## Settled scope decisions
+
+  - SQL surface: `SELECT`, including joins and subqueries. Every reference to a
+    policy-bearing table — in `FROM`, in any `JOIN`, in subqueries, in CTEs, in
+    UNION branches — must be constrained, or the statement is rejected.
+    Write statements (`INSERT`/`UPDATE`/`DELETE`) are out of scope for the MVP
+    and are rejected when they touch a policy table.
+  - Default rule: a table with no policy configured for the requesting user is
+    unrestricted and passes through. Only configured tables are filtered. This
+    matches how Doris RESTRICTIVE policies behave.
+  - Backend connections: 1:1 per client. No pooling, no multiplexing.
+  - Authentication: passthrough — client credentials relayed to Doris. Policy is
+    keyed on the username, and may only be applied once the backend has
+    authenticated that user; an unauthenticated claimed username is not an
+    identity.
+  - Parse strategy: full parse, not pattern matching.
+  - Out of scope unless explicitly revisited: sharding, read/write splitting,
+    multi-backend routing, connection pooling.
+
+  ## Why a proxy at all, given Doris ships this natively
+
+  Apache Doris has supported `CREATE ROW POLICY` since version 1.2:
+  `CREATE ROW POLICY p ON db.t AS RESTRICTIVE TO user USING (c IN ('a','b'))`.
+  It is enforced inside the FE, cannot be bypassed by SQL the proxy fails to
+  parse, and is strictly stronger than anything a rewriting proxy can offer.
+
+  The project's stated reasons for building the proxy regardless:
+
+  1. Policy configuration lives OUTSIDE Doris — owned by the app/platform team
+     in version control, reviewable and diffable and deployable, rather than
+     existing as mutable DDL state inside a cluster.
+  2. Central control across clusters — one policy set enforced over several
+     Doris backends instead of duplicating DDL in each.
+
+  Any proposal must be honest that the native mechanism is the stronger
+  enforcement point, and must not claim security properties the proxy cannot
+  deliver. Where the proxy is weaker, say where and why.
+
+  ## Tech stack
+
+  - Rust (edition 2021+), Cargo. The crate lives in this workspace directory.
+  - `sqlparser` with `MySqlDialect` for full SQL parsing.
+  - Tests are the real enforcement: `cargo test`, `proptest`, `cargo mutants`.
+    Neither OpenSpec nor any SDD tool enforces anything semantic — the tests
+    keep the code honest; the spec keeps the tests honest. For a security
+    control this matters more than usual: prefer property tests and negative
+    tests that attempt bypass over example tests that confirm the happy path.
+
+  ## Where the specs should focus
+
+  Anchor every spec and worked example on the rewriting path: PARSE -> REWRITE
+  -> FORWARD. Handshake, capability flags, packet framing and sequence IDs are
+  incidental plumbing; an earlier pass wasted most of its effort by using them
+  as the illustrative example.
+
+  Specify what an outsider can observe (which statements are accepted, which are
+  rejected, what rows come back, what error the client sees). Do NOT try to
+  specify what only the compiler and profiler can adjudicate (async task
+  topology, cancellation safety, buffer ownership, error-enum shape) — those are
+  recorded as after-the-fact ADRs instead, because ADRs are immutable history
+  and therefore cannot drift.
+
+  ## Cross-cutting invariants — every change must respect these
+
+  1. No unbounded buffering. Memory per connection is constant with respect to
+     result size.
+  2. No panic on client input. The decoder consumes attacker-controlled bytes.
+  3. A rewrite MUST NOT change `?` placeholder count, order, or result column
+     shape. This keeps `COM_STMT_PREPARE` tractable. An injected predicate built
+     from configured literals satisfies this; one using `?` would not.
+  4. A rewrite MUST NOT change the result set except by removing rows the user
+     is not permitted to see. It must not alter column shape, column order,
+     aggregate semantics over the permitted rows, or ordering among them.
+  5. Unsupported is explicit. Reject with a clear error rather than
+     half-applying a rule. Half-applied filtering is the worst outcome available
+     — it looks like it worked.
+  6. Enforcement must be provable statement-by-statement. If the rewriter cannot
+     enumerate every table reference in a statement and show each policy-bearing
+     one was constrained, the statement does not run.
+
+  ## Known bypass vectors — address explicitly, do not rediscover
+
+  These are the ways SQL-rewriting row filters leak. A spec that ignores them is
+  incomplete:
+
+  - Subqueries, derived tables, CTEs and UNION branches that read the policy
+    table without the outer predicate applying to them.
+  - Joins where the predicate lands on the wrong relation, or where an OUTER
+    join turns a filtered row into a NULL-extended row that still leaks
+    existence.
+  - Aliases and qualified vs unqualified table names; the same table reached
+    through different spellings, or through the session's default database.
+  - Views and prepared statements, where the text the proxy sees is not the text
+    Doris executes.
+  - `information_schema` and metadata queries that disclose the existence and
+    shape of restricted data.
+  - Multi-statement packets and comments used to smuggle a second statement.
+  - Predicate placement changing meaning: injecting into `WHERE` versus `ON`
+    versus wrapping the relation are not equivalent, and `OR` in an existing
+    `WHERE` can nullify a naively appended `AND`. Parenthesisation is a
+    correctness property, not a formatting detail.
+
+rules:
+  proposal:
+    - State explicitly which statements become newly REJECTED by this change.
+      Reduced compatibility is a user-visible consequence and belongs in the
+      proposal, not buried in the design.
+    - Always include a "Non-goals" section.
+    - Be honest about the enforcement boundary — name what this change does NOT
+      protect against, and do not claim a property the proxy cannot deliver.
+    - Justify the mechanism against Doris `CREATE ROW POLICY` rather than
+      assuming a proxy is the right place for the control.
+  design:
+    - Enumerate the bypass vectors this design closes AND the ones it leaves
+      open, explicitly. An unlisted vector reads as a claim that it is handled.
+    - Show where the injected predicate lands for each supported query shape,
+      including parenthesisation, and argue why that placement is correct.
+    - Name the parse failures this design rejects and the resulting client-
+      visible error, since `sqlparser` has no Doris dialect.
+    - Record decisions that are NOT spec-shaped (task topology, buffer
+      ownership, error-enum shape) as rationale here, and plan to promote them
+      to an ADR under `docs/adr/` after the fact rather than specifying them.
+  specs:
+    - Every requirement needs at least one scenario, and every rewrite
+      requirement needs a NEGATIVE scenario — a statement that must be
+      rejected, and an attempted bypass that must not return restricted rows.
+    - Scenario names become permanent once archived, and the archive check is
+      name-only — a scenario's meaning can be silently inverted later. Name
+      scenarios for the behaviour they assert, not for the change that
+      introduced them.
+  tasks:
+    - Pair each behavioural task with the test that proves it. A filtering rule
+      without a test that attempts to defeat it is not done.
+    - Include an explicit task for the rejection path of every shape the
+      rewriter does not support; forgetting one is how fail-closed silently
+      becomes fail-open.
+
+operations:
+  apply:
+    guidance:
+      - Run `cargo test`, `cargo fmt` and `cargo clippy` before marking tasks
+        complete, and report failures verbatim rather than summarizing them.
+      - Record parser and dialect surprises as they are found, with provenance;
+        they are the expected source of drift in this project.
+      - If implementation reveals a query shape the design did not anticipate,
+        stop and reject it rather than improvising a rewrite for it.
+  archive:
+    guidance:
+      - Before archiving, confirm the change's requirements are reflected in the
+        canonical spec and that no scenario was dropped from a MODIFIED block.
+      - Note anything the process caught that code review would not have — that
+        is the actual output of this exercise.
