@@ -44,6 +44,23 @@ pub enum RefusalReason {
     #[error("write statements against restricted tables are not permitted")]
     WriteToRestrictedTable,
 
+    /// A session-configuring statement would have read a restricted table's rows
+    /// into session state.
+    ///
+    /// `SET @x = (SELECT total FROM sales.orders)` puts rows somewhere the proxy
+    /// does not track, and `SELECT @x` returns them afterwards — so wrapping the
+    /// relation would not bound what the client can read. Refusing is the only
+    /// honest answer.
+    ///
+    /// Unlike [`Self::UnresolvableTableReference`], this one gets wording of its
+    /// own. That refusal fires for tables that only *might* be policy-bearing,
+    /// so distinct wording would confirm which; this one fires only for tables
+    /// that *are*, and [`Self::WriteToRestrictedTable`] already discloses exactly
+    /// that much in the same situation. Saying so plainly costs nothing and tells
+    /// an operator which control refused.
+    #[error("statements that read a restricted table into session state are not permitted")]
+    RestrictedTableIntoSessionState,
+
     #[error("multiple statements per request are not permitted")]
     MultiStatement,
 

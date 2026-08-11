@@ -152,12 +152,36 @@ pub enum StatementKind {
     Replace,
     Update,
     Delete,
+    /// `SET` — configures the session. Analysed like anything else rather than
+    /// waved through: `SET @x = (SELECT total FROM sales.orders)` reads a table,
+    /// and `SELECT @x` returns it afterwards.
+    Session,
+    /// `SHOW` — reports metadata.
+    Metadata,
 }
 
 impl StatementKind {
     /// `INSERT`, `REPLACE`, `UPDATE` and `DELETE` are writes. The MVP refuses
     /// them against policy-bearing tables rather than constraining them.
     pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            StatementKind::Insert
+                | StatementKind::Replace
+                | StatementKind::Update
+                | StatementKind::Delete
+        )
+    }
+
+    /// Whether a policy-bearing reference in this kind of statement must be
+    /// **refused** rather than constrained by wrapping.
+    ///
+    /// Only `SELECT` can be constrained. A write is out of scope for the MVP. A
+    /// `SET` or `SHOW` puts its result somewhere the proxy does not track —
+    /// session state, or a metadata result whose shape the guard does not
+    /// apply to — so wrapping the relation inside it would not bound what the
+    /// client can read afterwards. Refusing is the honest answer.
+    pub fn must_refuse_policy_tables(self) -> bool {
         !matches!(self, StatementKind::Select)
     }
 }
@@ -368,6 +392,18 @@ fn statement_kind(statement: &Statement) -> AnalysisResult<StatementKind> {
         }
         Statement::Update(_) => StatementKind::Update,
         Statement::Delete(_) => StatementKind::Delete,
+        Statement::Set(_) => StatementKind::Session,
+        Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ShowCharset(_)
+        | Statement::ShowVariable { .. }
+        | Statement::ShowCreate { .. } => StatementKind::Metadata,
         other => return unsupported(format!("{} statement", variant_name(other))),
     })
 }
@@ -466,7 +502,181 @@ pub fn walk_statement<V: SiteVisitor>(statement: &mut Statement, v: &mut V) -> A
         Statement::Insert(insert) => walk_insert(insert, &mut scope, v),
         Statement::Update(update) => walk_update(update, &mut scope, v),
         Statement::Delete(delete) => walk_delete(delete, &mut scope, v),
+        Statement::Set(set) => walk_set(set, &mut scope, v),
+        // The name after `FROM`/`IN` means different things per statement, and
+        // `ShowStatementOptions` does not record which: `parent_type` is a
+        // Snowflake field that `MySqlDialect` always leaves `None`. So the
+        // statement kind is the only thing that says whether that name is a
+        // table, and it is passed in explicitly rather than sniffed.
+        Statement::ShowColumns { show_options, .. } => {
+            walk_show_options(show_options, NameIsTable::Yes, &mut scope, v)
+        }
+        Statement::ShowTables { show_options, .. }
+        | Statement::ShowDatabases { show_options, .. }
+        | Statement::ShowSchemas { show_options, .. }
+        | Statement::ShowViews { show_options, .. } => {
+            walk_show_options(show_options, NameIsTable::No, &mut scope, v)
+        }
+        Statement::ShowVariables { filter, .. }
+        | Statement::ShowStatus { filter, .. }
+        | Statement::ShowCollation { filter } => walk_show_filter(filter.as_mut(), &mut scope, v),
+        Statement::ShowCharset(show) => walk_show_filter(show.filter.as_mut(), &mut scope, v),
+        Statement::ShowVariable { variable } => walk_show_variable(variable),
+        Statement::ShowCreate { obj_type, obj_name } => walk_show_create(obj_type, obj_name, v),
         other => unsupported(format!("{} statement", variant_name(other))),
+    }
+}
+
+/// Walk a `SET`, enumerating any table its assigned expressions read.
+///
+/// `SET` is **not** inert, which is the whole reason it goes through the walk
+/// rather than being waved through as harmless session chatter:
+///
+/// ```sql
+/// SET @x = (SELECT total FROM sales.orders);
+/// SELECT @x;   -- returns it, with no policy-bearing reference in sight
+/// ```
+///
+/// Forwarding every `SET` because "it cannot return rows" would be a live
+/// bypass. Enumerating the assigned expressions puts that statement on exactly
+/// the same footing as any other read of the table.
+fn walk_set<V: SiteVisitor>(
+    set: &mut sqlparser::ast::Set,
+    scope: &mut CteScope,
+    v: &mut V,
+) -> AnalysisResult<()> {
+    use sqlparser::ast::Set;
+    match set {
+        Set::SingleAssignment { values, .. } | Set::ParenthesizedAssignments { values, .. } => {
+            for value in values {
+                walk_expr(value, scope, v)?;
+            }
+            Ok(())
+        }
+        Set::MultipleAssignments { assignments } => {
+            for assignment in assignments {
+                walk_expr(&mut assignment.value, scope, v)?;
+            }
+            Ok(())
+        }
+        Set::SetTimeZone { value, .. } => walk_expr(value, scope, v),
+        // `SET NAMES utf8mb4` — a charset and an optional collation, both bare
+        // identifiers. This is the statement almost every connector sends first,
+        // and it reads nothing.
+        Set::SetNames { .. } | Set::SetNamesDefault {} => Ok(()),
+        // Transaction modes are a fixed enum; the snapshot is a literal.
+        Set::SetTransaction { .. } => Ok(()),
+        // `SET ROLE` changes which privileges the session holds. Policy is keyed
+        // on the authenticated username, which does not change — but the rows
+        // the backend will return may, and the proxy has no model of that.
+        Set::SetRole { .. } => unsupported("SET ROLE"),
+        Set::SetSessionAuthorization(_) => unsupported("SET SESSION AUTHORIZATION"),
+        Set::SetSessionParam(_) => unsupported("SET session parameter"),
+    }
+}
+
+/// Whether the name after `FROM`/`IN` in a `SHOW` names a table or a database.
+///
+/// `SHOW COLUMNS FROM sales.orders` names a table; `SHOW TABLES FROM sales`
+/// names a database. Enumerating the latter as a table would ask the policy
+/// layer the wrong question, and a policy on `sales.orders` must not be matched
+/// by `SHOW TABLES FROM sales`.
+#[derive(Clone, Copy, PartialEq)]
+enum NameIsTable {
+    Yes,
+    No,
+}
+
+fn walk_show_options<V: SiteVisitor>(
+    options: &mut sqlparser::ast::ShowStatementOptions,
+    names_a_table: NameIsTable,
+    scope: &mut CteScope,
+    v: &mut V,
+) -> AnalysisResult<()> {
+    if let Some(show_in) = &options.show_in {
+        if let Some(parent_name) = &show_in.parent_name {
+            if names_a_table == NameIsTable::Yes {
+                v.visit_write_target(parent_name)?;
+            }
+        }
+    }
+    if let Some(limit) = &mut options.limit {
+        walk_expr(limit, scope, v)?;
+    }
+    match &mut options.filter_position {
+        None => {}
+        Some(
+            sqlparser::ast::ShowStatementFilterPosition::Infix(filter)
+            | sqlparser::ast::ShowStatementFilterPosition::Suffix(filter),
+        ) => walk_show_filter(Some(filter), scope, v)?,
+    }
+    Ok(())
+}
+
+fn walk_show_filter<V: SiteVisitor>(
+    filter: Option<&mut sqlparser::ast::ShowStatementFilter>,
+    scope: &mut CteScope,
+    v: &mut V,
+) -> AnalysisResult<()> {
+    use sqlparser::ast::ShowStatementFilter;
+    match filter {
+        None => Ok(()),
+        // Patterns are literals.
+        Some(ShowStatementFilter::Like(_))
+        | Some(ShowStatementFilter::ILike(_))
+        | Some(ShowStatementFilter::NoKeyword(_)) => Ok(()),
+        Some(ShowStatementFilter::Where(expr)) => walk_expr(expr, scope, v),
+    }
+}
+
+/// `Statement::ShowVariable` is `sqlparser`'s catch-all for `SHOW <words>` forms
+/// it does not model, and it hands back the raw tokens uninterpreted:
+///
+/// ```text
+/// SHOW ENGINES                  -> ["ENGINES"]
+/// SHOW INDEX FROM sales.orders  -> ["INDEX", "FROM", "sales", "orders"]
+/// ```
+///
+/// A single token cannot name anything, so there is nothing to enumerate and the
+/// statement is forwarded — this is what keeps `SHOW ENGINES`, `SHOW WARNINGS`,
+/// `SHOW GRANTS` and friends working.
+///
+/// Anything longer *does* contain a name, and recovering which token is the
+/// table would mean reimplementing MySQL's `SHOW` grammar from a token list —
+/// precisely the guessing D3's allowlist exists to forbid. So those refuse.
+/// `SHOW INDEX FROM sales.orders` is the case that matters: it discloses
+/// metadata about a policy-bearing table, and the walk cannot locate the name
+/// reliably enough to ask the policy layer about it.
+fn walk_show_variable(variable: &[Ident]) -> AnalysisResult<()> {
+    if variable.len() > 1 {
+        return unsupported("SHOW form this proxy cannot parse into named objects");
+    }
+    Ok(())
+}
+
+/// `SHOW CREATE TABLE sales.orders` names a table, so it is enumerated and the
+/// statement is refused when that table is policy-bearing.
+///
+/// It discloses the table's definition rather than its rows, and metadata
+/// disclosure is an accepted limitation of this control — but the spec's rule is
+/// that every table reference is enumerated and the statement forwarded only if
+/// none is policy-bearing, and this is a table reference. Refusing is also the
+/// direction that costs nothing: `SHOW CREATE TABLE` on an unrestricted table
+/// still works, and `SHOW TABLES` still lists everything.
+fn walk_show_create<V: SiteVisitor>(
+    obj_type: &sqlparser::ast::ShowCreateObject,
+    obj_name: &ObjectName,
+    v: &mut V,
+) -> AnalysisResult<()> {
+    use sqlparser::ast::ShowCreateObject;
+    match obj_type {
+        ShowCreateObject::Table | ShowCreateObject::View => v.visit_write_target(obj_name),
+        // An event, function, procedure or trigger name is not a table, so
+        // there is nothing here the policy layer could resolve.
+        ShowCreateObject::Event
+        | ShowCreateObject::Function
+        | ShowCreateObject::Procedure
+        | ShowCreateObject::Trigger => Ok(()),
     }
 }
 

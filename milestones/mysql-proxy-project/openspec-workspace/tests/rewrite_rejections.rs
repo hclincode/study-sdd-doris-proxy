@@ -39,11 +39,15 @@ fn unparseable_statement_from_a_policy_bearing_user_is_rejected() {
 /// would require understanding SQL that has just failed to parse.
 #[test]
 fn unparseable_statement_from_an_unrestricted_user_is_forwarded() {
+    // `SHOW TABLES` was in this list as an example of something unanalysable.
+    // It is analysable now, so it would still be forwarded here but for an
+    // entirely different reason — passing while illustrating nothing. Dropped
+    // rather than left to look like coverage; it is covered by
+    // `metadata_statements_are_forwarded` below.
     let unrestricted = TestPolicies::unrestricted();
     for sql in [
         "SELCT * FROM sales.orders",
         "SELECT * FROM sales.orders LATERAL VIEW explode(items) t AS item",
-        "SHOW TABLES",
         "SELECT * FROM sales.orders; SELECT 1",
     ] {
         assert_eq!(
@@ -71,9 +75,13 @@ fn statement_shape_the_rewriter_does_not_support_is_rejected() {
         "SELECT * FROM sales.orders PARTITION (p0)",
         // A three-part name the policy layer cannot resolve.
         "SELECT * FROM internal.sales.orders",
-        // A statement kind outside SELECT and the four write forms.
-        "SHOW TABLES",
-        "SET autocommit = 1",
+        // `SHOW TABLES` and `SET autocommit = 1` were here, on the premise that
+        // any statement kind outside SELECT and the four write forms is an
+        // unsupported shape. That premise is gone: session and metadata
+        // statements are analysed by the same walk as everything else and
+        // forwarded when they touch no policy table. See "Session-management
+        // and metadata statements are analysed, not categorically refused" and
+        // the tests for it below.
     ] {
         assert!(
             matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
@@ -329,4 +337,104 @@ fn an_unresolvable_reference_is_caught_before_the_wrapper_runs() {
             .is_err(),
         "an unresolvable reference must refuse the statement, not pass the pre-check"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session and metadata statements — `row-filter-rewrite`, "Session-management
+// and metadata statements are analysed, not categorically refused"
+// ---------------------------------------------------------------------------
+
+/// Spec: "A session statement that reads no table is forwarded".
+///
+/// The blocker found against a real Doris: nearly every connector issues these
+/// before its first query, and refusing them means the proxy cannot serve a
+/// normal client at all. Our own tests missed it because `mysql -e` sends none
+/// of them for a one-shot query.
+#[test]
+fn session_statements_reading_no_table_are_forwarded() {
+    for sql in [
+        "SET NAMES utf8mb4",
+        "SET autocommit=1",
+        "SET SESSION sql_mode = ''",
+        "SET @@session.time_zone = '+00:00'",
+    ] {
+        assert_eq!(
+            TestPolicies::analyst().rewrite(sql).ok().as_deref(),
+            Some(sql),
+            "{sql:?} must reach the backend unchanged"
+        );
+    }
+}
+
+/// Spec: "A session statement that reads a policy table is refused".
+///
+/// The reason it cannot simply be forwarded: the rows land in session state,
+/// which the proxy does not track, and `SELECT @x` returns them afterwards. A
+/// guard around the relation would bound nothing.
+#[test]
+fn a_session_statement_reading_a_policy_table_is_refused() {
+    let reason = TestPolicies::analyst()
+        .rewrite("SET @x = (SELECT total FROM sales.orders)")
+        .expect_err("reading a policy table into session state must be refused");
+    assert!(
+        matches!(reason, RefusalReason::RestrictedTableIntoSessionState),
+        "expected a session-state refusal, got {reason:?}"
+    );
+}
+
+/// Spec: "A metadata statement naming a policy table is forwarded".
+///
+/// **This is the scenario a refuse-everything-but-SELECT rule gets wrong.** The
+/// statement names the table without reading its rows, and the same metadata is
+/// already reachable through `information_schema`, which carries no policy and
+/// is forwarded. Refusing here would break clients that introspect while
+/// withholding nothing — the two routes to the same disclosure must not
+/// disagree.
+#[test]
+fn a_metadata_statement_naming_a_policy_table_is_forwarded() {
+    for sql in [
+        "SHOW COLUMNS FROM sales.orders",
+        "SHOW CREATE TABLE sales.orders",
+    ] {
+        assert_eq!(
+            TestPolicies::analyst().rewrite(sql).ok().as_deref(),
+            Some(sql),
+            "{sql:?} names a policy table but discloses no rows, so it is forwarded"
+        );
+    }
+}
+
+/// Spec: "A metadata statement is forwarded".
+#[test]
+fn metadata_statements_are_forwarded() {
+    for sql in ["SHOW TABLES", "SHOW DATABASES", "SHOW VARIABLES"] {
+        assert_eq!(
+            TestPolicies::analyst().rewrite(sql).ok().as_deref(),
+            Some(sql),
+            "{sql:?} must reach the backend unchanged"
+        );
+    }
+}
+
+/// Spec: "An ordinary client can complete a connection".
+///
+/// The end-to-end form of the blocker: the sequence a MySQL connector sends
+/// before its first query must all get through, in order, for one restricted
+/// user.
+#[test]
+fn an_ordinary_connector_handshake_sequence_is_forwarded() {
+    let session = TestPolicies::analyst();
+    for sql in [
+        "SET NAMES utf8mb4",
+        "SET character_set_results = NULL",
+        "SET autocommit=1",
+        "SET SESSION sql_mode = ''",
+        "SHOW VARIABLES",
+        "SELECT * FROM sales.products",
+    ] {
+        assert!(
+            session.rewrite(sql).is_ok(),
+            "a connector's opening statement was refused: {sql:?}"
+        );
+    }
 }

@@ -547,14 +547,24 @@ fn group_by_with_rollup_is_not_parseable_by_this_dialect() {
     ));
 }
 
+/// `SHOW TABLES` and `SET autocommit = 1` used to be in this list, and their
+/// removal is the point of the session-management requirement rather than a
+/// relaxation of the allowlist: they are now *analysed* — enumerated like
+/// anything else and forwarded because they read no table — not waved through
+/// for being of their kind. See `a_session_statement_that_reads_no_table_…` and
+/// `a_metadata_statement_listing_objects_…` below.
+///
+/// Refusing them was D6 behaving exactly as specified, and it made the proxy
+/// unable to serve any ordinary MySQL connector, every one of which sends
+/// `SET NAMES` before its first query.
 #[test]
 fn a_statement_kind_outside_the_allowlist_cannot_be_analysed() {
     for sql in [
-        "SHOW TABLES",
         "CREATE TABLE t (a INT)",
-        "SET autocommit = 1",
+        "DROP TABLE sales.orders",
         "USE sales",
         "EXPLAIN SELECT * FROM sales.orders",
+        "ANALYZE TABLE sales.orders",
     ] {
         assert!(
             matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
@@ -734,4 +744,164 @@ proptest! {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session-management and metadata statements
+// ---------------------------------------------------------------------------
+
+/// Table names enumerated for `sql`, or the panic message if it was refused.
+fn tables_of(sql: &str) -> Vec<String> {
+    analyze(sql)
+        .unwrap_or_else(|reason| panic!("{sql:?} should analyse: {reason}"))
+        .tables
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+/// Spec: "A session statement that reads no table is forwarded".
+///
+/// These are the statements a MySQL connector sends before its first query.
+/// Refusing them — which D6's rule did, correctly by its own terms — meant the
+/// proxy could not serve a normal client at all: JDBC, ODBC, Python and Go all
+/// issue `SET NAMES` on connect. They enumerate nothing, so there is nothing to
+/// constrain and nothing to refuse.
+#[test]
+fn a_session_statement_that_reads_no_table_enumerates_nothing() {
+    for sql in [
+        "SET NAMES utf8mb4",
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+        "SET autocommit=1",
+        "SET SESSION sql_mode=''",
+        "SET @@session.time_zone='+00:00'",
+        "SET character_set_results=NULL",
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET @x = 1",
+    ] {
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert_eq!(analysis.kind, StatementKind::Session, "for {sql:?}");
+        assert!(analysis.tables.is_empty(), "{sql:?} enumerated a table");
+    }
+}
+
+/// Spec: "A session statement that reads a policy table is refused" — the
+/// enumeration half, which is what makes the refusal possible.
+///
+/// **`SET` is not inert.** `SET @x = (SELECT total FROM sales.orders)` reads the
+/// table, and `SELECT @x` afterwards returns what it read, with no
+/// policy-bearing reference anywhere in that second statement. Forwarding every
+/// `SET` because "it cannot return rows" would be a live bypass, which is why
+/// these go through the same walk as everything else rather than being
+/// special-cased as session chatter.
+#[test]
+fn a_session_statement_reading_a_table_enumerates_it() {
+    assert_eq!(
+        tables_of("SET @x = (SELECT total FROM sales.orders)"),
+        ["sales.orders"]
+    );
+    // Not only the first assignment.
+    assert_eq!(
+        tables_of("SET @x = 1, @y = (SELECT total FROM sales.orders)"),
+        ["sales.orders"]
+    );
+    // Nested as deeply as anywhere else.
+    assert_eq!(
+        tables_of("SET @x = (SELECT SUM(t.total) FROM (SELECT * FROM sales.orders) t)"),
+        ["sales.orders"]
+    );
+    // And through a predicate rather than the projection.
+    assert_eq!(
+        tables_of(
+            "SET @x = (SELECT 1 FROM sales.products WHERE id IN (SELECT pid FROM sales.orders))"
+        ),
+        ["sales.products", "sales.orders"]
+    );
+}
+
+/// Spec: "A metadata statement is forwarded". Listing tables or databases
+/// enumerates nothing — metadata disclosure is a documented limitation of this
+/// control, not something it claims to prevent.
+///
+/// `SHOW TABLES FROM sales` names a *database*, and must not be enumerated as a
+/// table: a policy on `sales.orders` must not be matched by it. `sqlparser`'s
+/// `ShowStatementIn::parent_type` looks like the field that would say so, but it
+/// is a Snowflake field that `MySqlDialect` always leaves `None` — so the
+/// distinction comes from the statement kind instead.
+#[test]
+fn a_metadata_statement_listing_objects_enumerates_nothing() {
+    for sql in [
+        "SHOW TABLES",
+        "SHOW TABLES FROM sales",
+        "SHOW FULL TABLES FROM sales",
+        "SHOW DATABASES",
+        "SHOW VARIABLES LIKE 'x'",
+        "SHOW STATUS",
+        "SHOW COLLATION",
+        "SHOW CHARACTER SET",
+        "SHOW ENGINES",
+        "SHOW WARNINGS",
+        "SHOW GRANTS",
+    ] {
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert_eq!(analysis.kind, StatementKind::Metadata, "for {sql:?}");
+        assert!(analysis.tables.is_empty(), "{sql:?} enumerated a table");
+    }
+}
+
+/// A metadata statement that names a *table* enumerates it, so it can be refused
+/// when that table is policy-bearing.
+#[test]
+fn a_metadata_statement_naming_a_table_enumerates_it() {
+    assert_eq!(
+        tables_of("SHOW COLUMNS FROM sales.orders"),
+        ["sales.orders"]
+    );
+    assert_eq!(
+        tables_of("SHOW FULL COLUMNS FROM sales.orders"),
+        ["sales.orders"]
+    );
+    assert_eq!(
+        tables_of("SHOW CREATE TABLE sales.orders"),
+        ["sales.orders"]
+    );
+    // A `WHERE` on a metadata statement is an expression like any other.
+    assert_eq!(
+        tables_of("SHOW VARIABLES WHERE Variable_name IN (SELECT region FROM sales.orders)"),
+        ["sales.orders"]
+    );
+}
+
+/// `sqlparser` parks the `SHOW` forms it does not model in `ShowVariable`, as an
+/// uninterpreted token list: `SHOW ENGINES` is `["ENGINES"]`, but
+/// `SHOW INDEX FROM sales.orders` is `["INDEX", "FROM", "sales", "orders"]`.
+///
+/// A single token names nothing, so it forwards. Anything longer contains a name
+/// the walk cannot locate without reimplementing MySQL's `SHOW` grammar from
+/// tokens — so it refuses. `SHOW INDEX FROM sales.orders` is the case that
+/// matters: it reports metadata about a policy-bearing table, and guessing which
+/// token is the table is exactly what D3's allowlist forbids.
+#[test]
+fn an_unmodelled_show_form_naming_something_is_refused() {
+    for sql in [
+        "SHOW INDEX FROM sales.orders",
+        "SHOW KEYS FROM sales.orders",
+        "SHOW TRIGGERS FROM sales",
+    ] {
+        assert!(
+            matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
+            "{sql:?} should refuse"
+        );
+    }
+}
+
+/// `SET ROLE` changes which privileges the session holds. Policy is keyed on the
+/// authenticated username, which does not change — but the rows the backend
+/// returns may, and the proxy has no model of that.
+#[test]
+fn set_role_is_refused() {
+    assert!(matches!(
+        refusal("SET ROLE admin"),
+        RefusalReason::UnsupportedShape { .. }
+    ));
 }

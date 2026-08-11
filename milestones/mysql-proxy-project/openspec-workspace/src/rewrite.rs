@@ -202,12 +202,48 @@ pub fn rewrite_statement(
         Coverage::Restricted => {}
     }
 
-    if analysis.kind.is_write() {
+    // Reaching here means at least one reference is policy-bearing. What to do
+    // about that is **this module's** decision, not the classifier's, so it is
+    // spelled out here rather than behind a predicate on `StatementKind`: the
+    // kinds are a fact about the SQL, this match is a policy about it.
+    //
+    // Exhaustive, and deliberately so — design D3's allowlist principle applied
+    // one level up. A new `StatementKind` upstream becomes a compile error here
+    // rather than falling into a default branch, and the default that would be
+    // convenient ("treat it like a SELECT and wrap it") is the one that silently
+    // fails to bound anything.
+    //
+    // There are three outcomes, which is why this is not a boolean:
+    match analysis.kind {
+        // The only kind a guard can constrain: its result reaches the client as
+        // a row set, which is what wrapping the relation bounds.
+        StatementKind::Select => {}
+
         // Constraining writes is out of scope for the MVP, and forwarding one
         // unconstrained would let a user modify rows outside their slice.
-        return Err(RefusalReason::WriteToRestrictedTable);
+        StatementKind::Insert
+        | StatementKind::Replace
+        | StatementKind::Update
+        | StatementKind::Delete => return Err(RefusalReason::WriteToRestrictedTable),
+
+        // The rows would land in session state, which the proxy does not track,
+        // and `SELECT @x` returns them afterwards. Wrapping the relation would
+        // not bound what the client can read, so refusing is the honest answer.
+        StatementKind::Session => return Err(RefusalReason::RestrictedTableIntoSessionState),
+
+        // Forwarded, not refused. A metadata statement *names* the table rather
+        // than reading its rows, and the same names are reachable through
+        // `information_schema`, which carries no policy and is forwarded — so a
+        // refusal here would break clients that introspect while withholding
+        // nothing. Metadata disclosure is an accepted, documented limitation of
+        // this control; the two routes to it must not disagree.
+        //
+        // This is the outcome a boolean "refuse or wrap" predicate could not
+        // express, and getting it wrong costs compatibility rather than
+        // confidentiality only because `information_schema` is already open. If
+        // that ever changes, this arm changes with it.
+        StatementKind::Metadata => return Ok(sql.to_string()),
     }
-    debug_assert_eq!(analysis.kind, StatementKind::Select);
 
     let mut wrapper = Wrapper { cx };
     walk_statement(&mut analysis.statement, &mut wrapper)?;

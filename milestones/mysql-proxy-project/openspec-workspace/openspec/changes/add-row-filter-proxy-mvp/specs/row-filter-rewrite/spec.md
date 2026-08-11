@@ -110,6 +110,39 @@ The proxy SHALL reject any `INSERT`, `UPDATE`, `DELETE` or `REPLACE` statement t
 - **WHEN** `analyst` issues an `UPDATE` against `sales.products`, for which no policy is configured for `analyst`
 - **THEN** the statement is forwarded
 
+### Requirement: Session-management and metadata statements are analysed, not categorically refused
+
+A statement that configures the session or reports metadata SHALL be analysed by the same rule as any other statement: every table reference in it is enumerated, and the statement is forwarded only if none of them is policy-bearing for the requesting user. Such statements SHALL NOT be refused merely for being of that kind, and SHALL NOT be forwarded merely for being of that kind.
+
+A statement that **reads** a policy-bearing table's rows into session state SHALL be refused. Its result does not reach the client as a row set — it lands somewhere the proxy does not track — so constraining it would not bound what the client can later read.
+
+A statement that merely **names** a policy-bearing table to report its metadata SHALL be forwarded. Refusing it would not withhold anything: the same information is reachable through `information_schema`, which carries no policy and is forwarded, so a refusal would cost compatibility and protect nothing. Metadata disclosure is an accepted and documented limitation of this control, and the two paths to it must not disagree.
+
+#### Scenario: A metadata statement naming a policy table is forwarded
+
+- **WHEN** a restricted user asks for the column list or definition of a policy-bearing table
+- **THEN** the statement is forwarded, because the same metadata is already reachable through `information_schema` and refusing it would protect nothing while breaking clients that introspect
+
+#### Scenario: A session statement that reads no table is forwarded
+
+- **WHEN** a restricted user issues a statement that sets a session variable to a literal, such as a character set, autocommit mode, or time zone
+- **THEN** the statement is forwarded to the backend unchanged
+
+#### Scenario: A session statement that reads a policy table is refused
+
+- **WHEN** a restricted user issues a statement assigning a session variable from a subquery that reads a policy-bearing table
+- **THEN** the proxy refuses it, rather than forwarding a statement whose result would be readable later through session state the proxy cannot constrain
+
+#### Scenario: A metadata statement is forwarded
+
+- **WHEN** a restricted user issues a statement listing tables or databases
+- **THEN** the statement is forwarded, consistent with metadata disclosure being an accepted and documented limitation rather than something this control claims to prevent
+
+#### Scenario: An ordinary client can complete a connection
+
+- **WHEN** a client connects and issues the session statements a MySQL connector ordinarily sends before its first query
+- **THEN** each is forwarded, and the client reaches a state where it can issue queries
+
 ### Requirement: A single request carries a single analysable statement
 
 The proxy SHALL reject a client request containing more than one statement when the requesting user has at least one configured policy, so that no statement reaches the backend without having been analysed in its own right.
