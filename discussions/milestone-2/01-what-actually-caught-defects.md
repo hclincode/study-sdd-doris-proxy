@@ -182,3 +182,100 @@ Specifically:
 What it did not contribute: any detection. The tests keep the code honest; the
 spec keeps the tests honest — and mutation testing keeps the tests honest about
 being honest.
+
+---
+
+## 9. The defect that produced a leak: a layer answering a question that was not its to answer
+
+Added 2026-08-11, after the metadata oracle. This is the only finding here where
+the written artifact was **right** and a live disclosure followed anyway, which
+makes it the most useful one.
+
+### What happened
+
+A restricted user could read the unfiltered contents of a policy table:
+
+```
+SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5   -> returns rows
+SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 3   -> returns nothing
+```
+
+A general-purpose oracle: any predicate over restricted rows, one bit at a time.
+
+### The wrong diagnosis, and the right one
+
+The lead's first reading was *"the spec sentence is correct but unimplementable
+— the rewriter is handed a flat table list with no provenance."* That framing is
+wrong in a way worth keeping, because it points at plumbing.
+
+The analyser's owner found the actual cause: **"names are forwarded" had been
+implemented by not enumerating the name at all.** Nothing was lost downstream;
+the distinction was never made. And not enumerating a reference *is a
+disposition decision* — it says "this one does not matter" — taken inside a layer
+whose job is to report what is there, and at the cost of breaking invariant 6,
+*every table reference enumerated*.
+
+> An analyser that quietly declines to report something is indistinguishable
+> from one that found nothing, and no care downstream can recover the
+> difference.
+
+### It had already happened once
+
+The same shape produced the escaping episode: the emitter tried to own a
+decision the configuration layer had already settled, and the two mechanisms
+were then correct only in combination, by an invariant neither stated. Both
+times the giveaway is a layer holding a policy rather than a fact.
+
+The stopgap fix showed the pattern a third time in miniature: refusing every
+metadata statement that reached the disposition arm was correct **only because
+naming statements happened to enumerate nothing**, so anything arriving there
+had to be a read. Nothing expressed that. Re-adding name enumeration for any
+reason would have silently reopened the hole.
+
+### What fixed it
+
+Provenance on each reference — `Named` versus `Relation` — and the decision
+placed at **lookup**, not at disposition: a `Named` reference resolves
+unrestricted, so a naming statement never looks policy-bearing and forwards by
+the ordinary path. One point that every consumer inherits, rather than one arm
+that the others can disagree with.
+
+The lead's spec sentence turned out to be implementable exactly as written. It
+needed the distinction made where the information still existed.
+
+### Why no test caught it
+
+Every metadata test **named** a table; none **read** one. The suite could not
+fail in the direction the bug lay — the fifth instance of §4's shape, and the
+first where it hid a live leak rather than an untested branch. 238 tests green,
+three end-to-end scenarios passing, and an oracle underneath.
+
+The regression tests are deliberately a **pair**: one is satisfied by refusing
+everything, the other by forwarding everything. Only together do they pin the
+line, which is worth stating in the tests themselves so neither is "simplified"
+later.
+
+### The mechanism that caught it, and who built it
+
+`visit_named` was given **no default implementation** — so a
+silently-do-nothing default could not recur. It became a compile error that
+forced an explicit answer in two visitors belonging to a different agent, then
+caught its own author's test visitor one layer further out.
+
+Designing a guard whose purpose is to fail in someone else's file, and having it
+work three times, is the strongest form of the exhaustive-match principle this
+project produced.
+
+### A fourth stale-artifact error, and the rule
+
+The lead re-measured the oracle after the fix and still saw it open — because
+the proxy was a **binary started before the change**. Filed with the three
+others (a file read after another agent fixed it; a mutation report read after
+the code moved; a suite committed without being read) as one family: the
+information was accurate about *something*, just not the thing being reasoned
+over.
+
+> Rebuild before measuring. When a measurement contradicts a change you believe
+> you made, suspect the artifact before suspecting the change — that is the
+> moment you are most likely to "fix" working code.
+
