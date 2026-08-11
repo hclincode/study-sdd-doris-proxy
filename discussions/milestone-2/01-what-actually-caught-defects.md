@@ -71,6 +71,34 @@ checked.
 express.** That question would have found all three before mutation testing
 did.
 
+### The same shape in a *measurement*, which is worse
+
+A fourth instance, found on day two and different in kind: not a stand-in for a
+collaborator, but a stand-in for a **client**.
+
+An end-to-end check was run by typing `SET NAMES utf8mb4` into a real `mysql`
+client and observing it forwarded. That was then recorded, by two people across
+at least four messages, as *"nearly every connector issues `SET NAMES` on
+connect"* — and a blocker was scoped around it.
+
+Putting a packet sniffer in front of the real client showed it sends
+`select @@version_comment limit 1` and nothing else; the charset is negotiated
+in the handshake packet, not by a statement. **The measurement was real. It was
+measuring us.**
+
+The lead had, in the same conversation, told the agent to prefer a real client
+over the project's own crate because "our own crate proving our own protocol
+handling would be close to circular" — and then cited as evidence a statement
+the lead had asked to be typed.
+
+> An instrument shaped by your own assumptions returns them. A mock narrower
+> than its collaborator hides that collaborator's defects; a *test input you
+> chose yourself* cannot tell you what a client sends.
+
+Operational form: **when a claim is about what someone else's software does,
+the evidence has to come from that software.** Anything you type is a
+hypothesis, however real the machinery it passes through.
+
 ---
 
 ## 4. A test that cannot fail in the direction the bug lies
