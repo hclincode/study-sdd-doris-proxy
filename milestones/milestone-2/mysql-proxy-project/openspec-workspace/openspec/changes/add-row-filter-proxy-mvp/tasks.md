@@ -1,3 +1,21 @@
+> ## CLOSED — 2026-08-11, at 70/75
+>
+> **Milestone 2 is closed and this change is closed with it.** It was not
+> archived: `openspec/specs/` stays empty and nothing was folded into canonical
+> form.
+>
+> The five unchecked items in §10 are **closed-unaddressed, not a backlog.**
+> They are left unticked deliberately — they were not done, and a ticked box
+> recording nothing is the exact false-signal shape this change kept finding.
+> Milestones are independent; milestone 3 starts from its own scope and does not
+> inherit these.
+>
+> Why it stopped here is the milestone's finding rather than a failure: §10 did
+> not exist when the change was written. It was opened by the first real client
+> and grew to eleven items while the first nine sections were closing, because
+> fail-closed rewriting against a foreign SQL dialect has an open-ended
+> compatibility surface. See `milestones/milestone-2.md` §5.
+
 ## 1. Toolchain and scaffold
 
 - [x] 1.1 Install a Rust toolchain — `cargo` and `rustc` are absent from PATH, which blocks every task below

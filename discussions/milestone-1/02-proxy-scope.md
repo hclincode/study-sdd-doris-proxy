@@ -13,7 +13,7 @@
 > Nothing below should be read as a current requirement, including the parts
 > marked "resolved". For current scope see `CLAUDE.md` — Proxy scope, and the
 > change under
-> `milestones/mysql-proxy-project/openspec-workspace/openspec/changes/`.
+> `milestones/milestone-2/mysql-proxy-project/openspec-workspace/openspec/changes/`.
 >
 > **Correction to the 2026-08-08 banner below.** That banner states that the
 > tenant-isolation analysis "no longer applies" because the rewrite is resource

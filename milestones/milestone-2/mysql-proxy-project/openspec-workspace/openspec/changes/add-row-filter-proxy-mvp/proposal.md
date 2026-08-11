@@ -51,7 +51,7 @@ None — this is the project's first change and `openspec/specs/` is empty.
 
 ## Impact
 
-- **New crate** in `milestones/mysql-proxy-project/openspec-workspace/`: `Cargo.toml`, `src/`. None of this exists yet.
+- **New crate** in `milestones/milestone-2/mysql-proxy-project/openspec-workspace/`: `Cargo.toml`, `src/`. None of this exists yet.
 - **New dependencies**: an async runtime, a MySQL wire-protocol implementation, and `sqlparser` with `MySqlDialect`. Specific crate selection belongs in `design.md`.
 - **Toolchain blocker**: Rust is not currently installed on this machine (`cargo` and `rustc` are absent from PATH). Planning is unaffected, but implementation cannot begin until a toolchain is present.
 - **Operational precondition**: clients must be prevented from reaching the Doris FE directly, or the control is decorative.
