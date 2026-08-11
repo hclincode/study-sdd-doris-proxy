@@ -929,3 +929,83 @@ fn set_role_is_refused() {
         RefusalReason::UnsupportedShape { .. }
     ));
 }
+
+/// Spec: "A transaction-control statement naming no table is forwarded", and
+/// "A client can complete a transaction it was allowed to begin".
+///
+/// Every one of these `sqlparser` variants carries only enums and identifiers —
+/// isolation levels, access modes, a savepoint name — and no `Expr`, so none of
+/// them can reference a table at all.
+///
+/// The second scenario is why they are on the allowlist rather than left to
+/// refuse: `SET autocommit=0` is forwarded, so refusing `COMMIT` would strand
+/// the client holding a transaction it cannot close. Forwarding one half of a
+/// pair while refusing the other is worse than refusing both. They share
+/// `StatementKind::Session` for the same reason — the pairing is structural
+/// rather than something two arms have to agree about.
+#[test]
+fn a_transaction_control_statement_is_forwarded() {
+    for sql in [
+        "BEGIN",
+        "BEGIN WORK",
+        "START TRANSACTION",
+        "START TRANSACTION READ ONLY",
+        "COMMIT",
+        "COMMIT WORK",
+        "COMMIT AND CHAIN",
+        "ROLLBACK",
+        "ROLLBACK WORK",
+        "SAVEPOINT sp1",
+        "ROLLBACK TO SAVEPOINT sp1",
+        "RELEASE SAVEPOINT sp1",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    ] {
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert_eq!(analysis.kind, StatementKind::Session, "for {sql:?}");
+        assert!(analysis.tables.is_empty(), "{sql:?} enumerated a table");
+    }
+}
+
+/// The pairing the spec demands, stated as one test so it cannot drift apart:
+/// every statement of an autocommit-off transaction sequence is analysable, so a
+/// client that is allowed to begin one is always allowed to close it.
+#[test]
+fn a_client_can_close_every_transaction_it_can_open() {
+    for sql in [
+        "SET autocommit=0",
+        "START TRANSACTION",
+        "SELECT * FROM sales.products",
+        "COMMIT",
+        "SET autocommit=1",
+    ] {
+        assert!(
+            analyze(sql).is_ok(),
+            "{sql:?} must be analysable, or a client can enter a state it cannot leave"
+        );
+    }
+}
+
+/// Transaction forms `MySqlDialect` cannot parse, recorded so the compatibility
+/// cost is visible and so a later `sqlparser` forces a decision rather than
+/// silently accepting them.
+///
+/// `START TRANSACTION WITH CONSISTENT SNAPSHOT` is the one that matters:
+/// `mysqldump --single-transaction` opens with exactly that, so a policy-bearing
+/// user cannot take a consistent dump through the proxy. `COMMIT RELEASE` and
+/// `ROLLBACK RELEASE` are ordinary MySQL too.
+///
+/// These refuse as `Unparseable`, not as an unsupported shape — the parser never
+/// produces a statement, so classification never sees them.
+#[test]
+fn transaction_forms_this_dialect_cannot_parse_are_recorded() {
+    for sql in [
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        "COMMIT RELEASE",
+        "ROLLBACK RELEASE",
+    ] {
+        assert!(
+            matches!(refusal(sql), RefusalReason::Unparseable),
+            "{sql:?} should refuse as unparseable"
+        );
+    }
+}

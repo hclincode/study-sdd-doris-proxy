@@ -152,14 +152,15 @@ pub enum StatementKind {
     Replace,
     Update,
     Delete,
-    /// `SET` — configures the session. Analysed like anything else rather than
-    /// waved through: `SET @x = (SELECT total FROM sales.orders)` reads a table,
-    /// and `SELECT @x` returns it afterwards.
+    /// `SET` and transaction control — anything that changes session state.
+    ///
+    /// Analysed like anything else rather than waved through:
+    /// `SET @x = (SELECT total FROM sales.orders)` reads a table, and
+    /// `SELECT @x` returns it afterwards. Transaction control shares this kind
+    /// because `SET autocommit=0` and `COMMIT` are two halves of one thing.
     Session,
     /// `SHOW` — reports metadata.
     Metadata,
-    /// `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` — controls a transaction.
-    Transaction,
 }
 
 impl StatementKind {
@@ -175,17 +176,18 @@ impl StatementKind {
         )
     }
 
-    /// Whether a policy-bearing reference in this kind of statement must be
-    /// **refused** rather than constrained by wrapping.
-    ///
-    /// Only `SELECT` can be constrained. A write is out of scope for the MVP. A
-    /// `SET` or `SHOW` puts its result somewhere the proxy does not track —
-    /// session state, or a metadata result whose shape the guard does not
-    /// apply to — so wrapping the relation inside it would not bound what the
-    /// client can read afterwards. Refusing is the honest answer.
-    pub fn must_refuse_policy_tables(self) -> bool {
-        !matches!(self, StatementKind::Select)
-    }
+    // `must_refuse_policy_tables()` lived here and is deliberately gone.
+    //
+    // It answered "refuse or constrain?" as a boolean, which was right while the
+    // rule had two outcomes. It stopped being right when metadata statements
+    // became a third: a `SHOW` that *names* a policy table is forwarded, while a
+    // `SET` that *reads* one is refused, and no boolean distinguishes three
+    // answers. The decision now lives in an exhaustive `match analysis.kind` in
+    // `rewrite.rs`, where a new `StatementKind` is a compile error rather than a
+    // silent default.
+    //
+    // Recorded rather than simply deleted so nobody reintroduces a predicate for
+    // a decision that is not binary.
 }
 
 /// A fully analysed statement: parsed, classified, and with every table
@@ -406,11 +408,18 @@ fn statement_kind(statement: &Statement) -> AnalysisResult<StatementKind> {
         | Statement::ShowCharset(_)
         | Statement::ShowVariable { .. }
         | Statement::ShowCreate { .. } => StatementKind::Metadata,
+        // Transaction control is session state, so it shares `Session` rather
+        // than getting a kind of its own. That is the faithful classification
+        // rather than a convenience: `SET autocommit=0` is already `Session`,
+        // and `COMMIT` is its other half. The spec requires the two to be
+        // treated consistently — forwarding one and refusing the other strands
+        // the client — and giving them one kind makes that pairing structural
+        // instead of something two separate arms have to agree about.
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
-        | Statement::ReleaseSavepoint { .. } => StatementKind::Transaction,
+        | Statement::ReleaseSavepoint { .. } => StatementKind::Session,
         other => return unsupported(format!("{} statement", variant_name(other))),
     })
 }

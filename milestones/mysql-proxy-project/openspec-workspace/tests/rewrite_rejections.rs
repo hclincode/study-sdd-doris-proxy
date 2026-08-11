@@ -387,6 +387,37 @@ fn a_session_statement_reading_a_policy_table_is_refused() {
     );
 }
 
+/// Transaction control reaches the backend.
+///
+/// The second blocker of the `SET NAMES` class: a connector that manages
+/// transactions, or any client that turns autocommit off, issues these before
+/// or around every statement. They were refused because the classifier did not
+/// recognise the kind, which sent them down the design-D6 branch — refused on
+/// `has_any_policy` alone, though `COMMIT` names no table at all.
+///
+/// They are not a kind of their own: transaction control *is* session state, so
+/// it classifies as `Session` and forwards for the ordinary reason rather than a
+/// special one — it touches no table, so there is nothing to constrain. A
+/// statement that reads a policy table into session state is still refused, and
+/// the test below covers that; these two facts have to keep holding together.
+#[test]
+fn transaction_control_statements_are_forwarded() {
+    let session = TestPolicies::analyst();
+    for sql in [
+        "BEGIN",
+        "START TRANSACTION",
+        "COMMIT",
+        "ROLLBACK",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    ] {
+        assert_eq!(
+            session.rewrite(sql).ok().as_deref(),
+            Some(sql),
+            "{sql:?} must reach the backend unchanged"
+        );
+    }
+}
+
 /// Spec: "A metadata statement naming a policy table is forwarded".
 ///
 /// **This is the scenario a refuse-everything-but-SELECT rule gets wrong.** The
