@@ -231,18 +231,40 @@ pub fn rewrite_statement(
         // not bound what the client can read, so refusing is the honest answer.
         StatementKind::Session => return Err(RefusalReason::RestrictedTableIntoSessionState),
 
-        // Forwarded, not refused. A metadata statement *names* the table rather
-        // than reading its rows, and the same names are reachable through
-        // `information_schema`, which carries no policy and is forwarded — so a
-        // refusal here would break clients that introspect while withholding
-        // nothing. Metadata disclosure is an accepted, documented limitation of
-        // this control; the two routes to it must not disagree.
+        // **Refused, pending provenance in the enumeration.** The spec says a
+        // metadata statement that merely *names* a policy table forwards, since
+        // the same names are reachable through `information_schema`, which
+        // carries no policy. That is still the intent — but it is not a rule
+        // this arm can currently implement, and forwarding was a live
+        // disclosure.
         //
-        // This is the outcome a boolean "refuse or wrap" predicate could not
-        // express, and getting it wrong costs compatibility rather than
-        // confidentiality only because `information_schema` is already open. If
-        // that ever changes, this arm changes with it.
-        StatementKind::Metadata => return Ok(sql.to_string()),
+        // `Analysis` gives a flat list of table references with no record of
+        // *why* each was enumerated, so these two are indistinguishable here:
+        //
+        //     SHOW COLUMNS FROM sales.orders                     -- names it
+        //     SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5
+        //
+        // The second evaluates a subquery against the table and reports the
+        // answer through whether any row comes back — an oracle that yields the
+        // true row count, and arbitrary values a bit at a time. Confirmed
+        // against a real Doris: a user restricted to 3 of 5 rows read the 5.
+        //
+        // Refusing here closes it and costs only metadata *about policy tables*:
+        // `SHOW TABLES`, `SHOW DATABASES`, `SHOW VARIABLES` and every statement
+        // a connector sends touch no policy table, so they never reach this arm
+        // — they are forwarded by the `Coverage::Unrestricted` path above. This
+        // is not a blanket refusal of metadata statements.
+        //
+        // Restore the forwarding rule once `RefPosition` distinguishes a
+        // name-position reference from an expression-position one: forward when
+        // *every* policy-bearing reference is name-position, refuse if any is
+        // expression-position. The regression test for the oracle must keep
+        // passing when that lands.
+        StatementKind::Metadata => {
+            return Err(RefusalReason::UnsupportedShape {
+                construct: "metadata statement referencing a restricted table".to_string(),
+            })
+        }
     }
 
     let mut wrapper = Wrapper { cx };

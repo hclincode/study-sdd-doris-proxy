@@ -418,24 +418,59 @@ fn transaction_control_statements_are_forwarded() {
     }
 }
 
-/// Spec: "A metadata statement naming a policy table is forwarded".
+/// **Regression test for a confirmed data-disclosure hole.** Do not relax this
+/// without reading why it exists.
 ///
-/// **This is the scenario a refuse-everything-but-SELECT rule gets wrong.** The
-/// statement names the table without reading its rows, and the same metadata is
-/// already reachable through `information_schema`, which carries no policy and
-/// is forwarded. Refusing here would break clients that introspect while
-/// withholding nothing — the two routes to the same disclosure must not
-/// disagree.
+/// A metadata statement's filter can evaluate a subquery against a policy table
+/// and report the answer through whether any row comes back. Against a real
+/// Doris, a user restricted to 3 of 5 rows read the true count of 5:
+///
+/// ```text
+/// SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5;  -- rows
+/// SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 3;  -- none
+/// ```
+///
+/// The same shape extracts arbitrary values a bit at a time, so it is an oracle
+/// over the whole table, not a single leaked number.
 #[test]
-fn a_metadata_statement_naming_a_policy_table_is_forwarded() {
+fn a_metadata_statement_cannot_be_used_as_an_oracle_over_a_policy_table() {
+    let session = TestPolicies::analyst();
+    for sql in [
+        "SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders) = 5",
+        "SHOW VARIABLES WHERE (SELECT COUNT(*) FROM sales.orders WHERE total > 400) = 1",
+        "SHOW TABLES WHERE (SELECT MAX(total) FROM sales.orders) > 100",
+    ] {
+        assert!(
+            session.rewrite(sql).is_err(),
+            "{sql:?} reaches the backend and answers a question about restricted rows"
+        );
+    }
+}
+
+/// A metadata statement *naming* a policy table is refused **for now**.
+///
+/// The spec says it should forward: the same names are reachable through
+/// `information_schema`, which carries no policy, so refusing withholds nothing
+/// and costs clients that introspect. That remains the intent.
+///
+/// It cannot be implemented yet. The enumeration records *which* tables a
+/// statement references but not *why*, so this shape and the oracle above are
+/// indistinguishable at the point of decision — and one of them had to be
+/// refused. Fail closed: prefer a false rejection over a false disclosure.
+///
+/// **When `RefPosition` gains name-position versus expression-position, this
+/// test flips back to asserting forwarding** and the oracle test above must
+/// still pass. Both halves are the requirement; neither alone is.
+#[test]
+fn a_metadata_statement_naming_a_policy_table_is_refused_pending_provenance() {
+    let session = TestPolicies::analyst();
     for sql in [
         "SHOW COLUMNS FROM sales.orders",
         "SHOW CREATE TABLE sales.orders",
     ] {
-        assert_eq!(
-            TestPolicies::analyst().rewrite(sql).ok().as_deref(),
-            Some(sql),
-            "{sql:?} names a policy table but discloses no rows, so it is forwarded"
+        assert!(
+            session.rewrite(sql).is_err(),
+            "{sql:?} is indistinguishable from an oracle until references carry provenance"
         );
     }
 }
