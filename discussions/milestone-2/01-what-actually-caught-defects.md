@@ -279,3 +279,22 @@ over.
 > you made, suspect the artifact before suspecting the change — that is the
 > moment you are most likely to "fix" working code.
 
+**This one is worse than the other three, and belongs first among them.** The
+others corrupt a *measurement*. This corrupts a **verification of a security
+fix**, and it ran in the harmless direction only by luck: seeing a closed hole
+as open costs an hour. The same error in the other direction — measuring a stale
+binary *after* a fix lands, and concluding a leak is closed while the running
+artifact still has it — ends with a false all-clear on a disclosure.
+
+The durable form is a habit rather than a rule, because a rule is something you
+remember and a habit is something you cannot forget:
+
+> For anything security-relevant, **rebuild in the same command that measures**,
+> so the binary and the claim cannot drift apart.
+
+Every end-to-end check the analyser's owner ran that day did `cargo build` and
+started the proxy in one invocation — not from foresight, but because
+restarting it separately was the tedious part. The lead ran them separately and
+was wrong. Convenience produced the safer procedure, which is worth knowing:
+when the correct habit is also the lazier one, it survives.
+
