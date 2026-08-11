@@ -110,9 +110,21 @@ The proxy SHALL reject any `INSERT`, `UPDATE`, `DELETE` or `REPLACE` statement t
 - **WHEN** `analyst` issues an `UPDATE` against `sales.products`, for which no policy is configured for `analyst`
 - **THEN** the statement is forwarded
 
-### Requirement: Session-management and metadata statements are analysed, not categorically refused
+### Requirement: Session-management, transaction-control and metadata statements are analysed, not categorically refused
 
-A statement that configures the session or reports metadata SHALL be analysed by the same rule as any other statement: every table reference in it is enumerated, and the statement is forwarded only if none of them is policy-bearing for the requesting user. Such statements SHALL NOT be refused merely for being of that kind, and SHALL NOT be forwarded merely for being of that kind.
+A statement that configures the session, controls a transaction, or reports metadata SHALL be analysed by the same rule as any other statement: every table reference in it is enumerated, and the statement is forwarded only if none of them is policy-bearing for the requesting user. Such statements SHALL NOT be refused merely for being of that kind, and SHALL NOT be forwarded merely for being of that kind.
+
+The proxy SHALL NOT leave a client able to enter a session state it cannot leave. Where one statement of a pair is forwarded, its counterpart SHALL be analysable too — forwarding `SET autocommit=0` while refusing `COMMIT` strands the client, and is worse than refusing both.
+
+#### Scenario: A transaction-control statement naming no table is forwarded
+
+- **WHEN** a restricted user begins, commits, or rolls back a transaction
+- **THEN** the statement is forwarded, because it names no table and so cannot return or write a restricted row
+
+#### Scenario: A client can complete a transaction it was allowed to begin
+
+- **WHEN** a restricted user turns off autocommit, begins a transaction, issues a query, and commits
+- **THEN** every statement in that sequence is either forwarded or refused consistently, and the client is never left holding an open transaction it cannot close
 
 A statement that **reads** a policy-bearing table's rows into session state SHALL be refused. Its result does not reach the client as a row set — it lands somewhere the proxy does not track — so constraining it would not bound what the client can later read.
 

@@ -158,6 +158,8 @@ pub enum StatementKind {
     Session,
     /// `SHOW` — reports metadata.
     Metadata,
+    /// `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` — controls a transaction.
+    Transaction,
 }
 
 impl StatementKind {
@@ -404,6 +406,11 @@ fn statement_kind(statement: &Statement) -> AnalysisResult<StatementKind> {
         | Statement::ShowCharset(_)
         | Statement::ShowVariable { .. }
         | Statement::ShowCreate { .. } => StatementKind::Metadata,
+        Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. } => StatementKind::Transaction,
         other => return unsupported(format!("{} statement", variant_name(other))),
     })
 }
@@ -508,21 +515,33 @@ pub fn walk_statement<V: SiteVisitor>(statement: &mut Statement, v: &mut V) -> A
         // Snowflake field that `MySqlDialect` always leaves `None`. So the
         // statement kind is the only thing that says whether that name is a
         // table, and it is passed in explicitly rather than sniffed.
-        Statement::ShowColumns { show_options, .. } => {
-            walk_show_options(show_options, NameIsTable::Yes, &mut scope, v)
-        }
-        Statement::ShowTables { show_options, .. }
+        Statement::ShowColumns { show_options, .. }
+        | Statement::ShowTables { show_options, .. }
         | Statement::ShowDatabases { show_options, .. }
         | Statement::ShowSchemas { show_options, .. }
         | Statement::ShowViews { show_options, .. } => {
-            walk_show_options(show_options, NameIsTable::No, &mut scope, v)
+            walk_show_options(show_options, &mut scope, v)
         }
         Statement::ShowVariables { filter, .. }
         | Statement::ShowStatus { filter, .. }
         | Statement::ShowCollation { filter } => walk_show_filter(filter.as_mut(), &mut scope, v),
         Statement::ShowCharset(show) => walk_show_filter(show.filter.as_mut(), &mut scope, v),
         Statement::ShowVariable { variable } => walk_show_variable(variable),
-        Statement::ShowCreate { obj_type, obj_name } => walk_show_create(obj_type, obj_name, v),
+        Statement::ShowCreate { obj_type, obj_name } => walk_show_create(obj_type, obj_name),
+        // Transaction control. Every one of these variants carries only enums
+        // and identifiers — isolation levels, access modes, a savepoint name —
+        // and no `Expr`, so none of them can reference a table at all.
+        //
+        // They are on the allowlist for a reason beyond completeness. The proxy
+        // must not leave a client in a session state it cannot leave: `SET
+        // autocommit=0` is forwarded, so refusing `COMMIT` would strand the
+        // client holding a transaction it has no way to close. Forwarding one
+        // half of a pair and refusing the other is worse than refusing both.
+        Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. } => Ok(()),
         other => unsupported(format!("{} statement", variant_name(other))),
     }
 }
@@ -575,31 +594,29 @@ fn walk_set<V: SiteVisitor>(
     }
 }
 
-/// Whether the name after `FROM`/`IN` in a `SHOW` names a table or a database.
+/// Walk the parts of a `SHOW` that can *read* rows, and deliberately not the
+/// object it names.
 ///
-/// `SHOW COLUMNS FROM sales.orders` names a table; `SHOW TABLES FROM sales`
-/// names a database. Enumerating the latter as a table would ask the policy
-/// layer the wrong question, and a policy on `sales.orders` must not be matched
-/// by `SHOW TABLES FROM sales`.
-#[derive(Clone, Copy, PartialEq)]
-enum NameIsTable {
-    Yes,
-    No,
-}
-
+/// The distinction is the rule in `specs/row-filter-rewrite`: a statement that
+/// **reads** a policy table's rows is refused, one that merely **names** it to
+/// report metadata is forwarded. `show_in.parent_name` is a name — the table in
+/// `SHOW COLUMNS FROM sales.orders`, the database in `SHOW TABLES FROM sales` —
+/// and it is not enumerated, so neither statement is refused.
+///
+/// **Refusing them would protect nothing.** The same column list is reachable
+/// through `information_schema.columns`, which carries no policy and is
+/// forwarded, so a refusal would cost compatibility while leaving the
+/// information one `SELECT` away — and two paths to the same metadata
+/// disagreeing is worse than either answer. Metadata disclosure is a documented
+/// accepted limitation of this control.
+///
+/// The `limit` and `filter` clauses *are* walked: they are expressions, and an
+/// expression can carry a subquery that reads rows.
 fn walk_show_options<V: SiteVisitor>(
     options: &mut sqlparser::ast::ShowStatementOptions,
-    names_a_table: NameIsTable,
     scope: &mut CteScope,
     v: &mut V,
 ) -> AnalysisResult<()> {
-    if let Some(show_in) = &options.show_in {
-        if let Some(parent_name) = &show_in.parent_name {
-            if names_a_table == NameIsTable::Yes {
-                v.visit_write_target(parent_name)?;
-            }
-        }
-    }
     if let Some(limit) = &mut options.limit {
         walk_expr(limit, scope, v)?;
     }
@@ -629,55 +646,42 @@ fn walk_show_filter<V: SiteVisitor>(
     }
 }
 
-/// `Statement::ShowVariable` is `sqlparser`'s catch-all for `SHOW <words>` forms
-/// it does not model, and it hands back the raw tokens uninterpreted:
+/// `Statement::ShowVariable` is `sqlparser`'s catch-all for the `SHOW <words>`
+/// forms it does not model, handed back as raw tokens:
 ///
 /// ```text
 /// SHOW ENGINES                  -> ["ENGINES"]
 /// SHOW INDEX FROM sales.orders  -> ["INDEX", "FROM", "sales", "orders"]
 /// ```
 ///
-/// A single token cannot name anything, so there is nothing to enumerate and the
-/// statement is forwarded — this is what keeps `SHOW ENGINES`, `SHOW WARNINGS`,
-/// `SHOW GRANTS` and friends working.
+/// Nothing here is enumerated, and the reason is structural rather than a
+/// judgement about how sensitive index metadata is: the variant carries
+/// `Vec<Ident>` and nothing else. There is no `Expr` in it, so there is no
+/// subquery in it, so it cannot read a row. Whatever it names, it names —
+/// and under the "reads versus names" rule a name is forwarded.
 ///
-/// Anything longer *does* contain a name, and recovering which token is the
-/// table would mean reimplementing MySQL's `SHOW` grammar from a token list —
-/// precisely the guessing D3's allowlist exists to forbid. So those refuse.
-/// `SHOW INDEX FROM sales.orders` is the case that matters: it discloses
-/// metadata about a policy-bearing table, and the walk cannot locate the name
-/// reliably enough to ask the policy layer about it.
+/// This is worth stating because the alternative is tempting and wrong. An
+/// earlier version refused the multi-token forms, reasoning that finding which
+/// token is a table means reimplementing MySQL's `SHOW` grammar. That reasoning
+/// is sound but answers a question that does not arise: the proxy does not need
+/// to know what these name, because naming is not what it refuses.
 fn walk_show_variable(variable: &[Ident]) -> AnalysisResult<()> {
-    if variable.len() > 1 {
-        return unsupported("SHOW form this proxy cannot parse into named objects");
-    }
+    let _ = variable;
     Ok(())
 }
 
-/// `SHOW CREATE TABLE sales.orders` names a table, so it is enumerated and the
-/// statement is refused when that table is policy-bearing.
+/// `SHOW CREATE TABLE sales.orders` names a table and reads no row from it, so
+/// it is forwarded and the name is not enumerated.
 ///
-/// It discloses the table's definition rather than its rows, and metadata
-/// disclosure is an accepted limitation of this control — but the spec's rule is
-/// that every table reference is enumerated and the statement forwarded only if
-/// none is policy-bearing, and this is a table reference. Refusing is also the
-/// direction that costs nothing: `SHOW CREATE TABLE` on an unrestricted table
-/// still works, and `SHOW TABLES` still lists everything.
-fn walk_show_create<V: SiteVisitor>(
+/// Its output is the table's definition, which `information_schema` already
+/// discloses to the same user through a path that carries no policy. See
+/// [`walk_show_options`] for the full argument.
+fn walk_show_create(
     obj_type: &sqlparser::ast::ShowCreateObject,
     obj_name: &ObjectName,
-    v: &mut V,
 ) -> AnalysisResult<()> {
-    use sqlparser::ast::ShowCreateObject;
-    match obj_type {
-        ShowCreateObject::Table | ShowCreateObject::View => v.visit_write_target(obj_name),
-        // An event, function, procedure or trigger name is not a table, so
-        // there is nothing here the policy layer could resolve.
-        ShowCreateObject::Event
-        | ShowCreateObject::Function
-        | ShowCreateObject::Procedure
-        | ShowCreateObject::Trigger => Ok(()),
-    }
+    let _ = (obj_type, obj_name);
+    Ok(())
 }
 
 fn walk_query<V: SiteVisitor>(

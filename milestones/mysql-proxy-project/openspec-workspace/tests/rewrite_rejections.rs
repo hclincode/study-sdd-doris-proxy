@@ -75,13 +75,18 @@ fn statement_shape_the_rewriter_does_not_support_is_rejected() {
         "SELECT * FROM sales.orders PARTITION (p0)",
         // A three-part name the policy layer cannot resolve.
         "SELECT * FROM internal.sales.orders",
-        // `SHOW TABLES` and `SET autocommit = 1` were here, on the premise that
-        // any statement kind outside SELECT and the four write forms is an
-        // unsupported shape. That premise is gone: session and metadata
-        // statements are analysed by the same walk as everything else and
-        // forwarded when they touch no policy table. See "Session-management
-        // and metadata statements are analysed, not categorically refused" and
-        // the tests for it below.
+        // A statement kind the classifier does not recognise. `SHOW TABLES` and
+        // `SET autocommit = 1` stood here until session and metadata statements
+        // gained a requirement of their own — they are now analysed by the same
+        // walk as everything else and forwarded when they touch no policy table.
+        //
+        // These two replace them rather than the entries simply being deleted,
+        // because the *kind* dimension still needs covering: a bare deletion
+        // would leave every remaining case `SELECT`-shaped, so nothing would
+        // prove that an unrecognised statement kind still refuses. The removal
+        // was the requirement landing, not the allowlist being relaxed.
+        "DROP TABLE sales.orders",
+        "ANALYZE TABLE sales.orders",
     ] {
         assert!(
             matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),

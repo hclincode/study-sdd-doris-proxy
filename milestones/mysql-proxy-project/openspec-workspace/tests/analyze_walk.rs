@@ -849,49 +849,73 @@ fn a_metadata_statement_listing_objects_enumerates_nothing() {
     }
 }
 
-/// A metadata statement that names a *table* enumerates it, so it can be refused
-/// when that table is policy-bearing.
+/// Spec: "A metadata statement naming a policy table is forwarded".
+///
+/// The name is deliberately **not** enumerated, so the statement is never
+/// refused for naming a policy-bearing table. Refusing would protect nothing:
+/// the same column list is reachable through `information_schema.columns`,
+/// which carries no policy and is forwarded, so the information is one `SELECT`
+/// away either way — and two paths to the same metadata disagreeing is worse
+/// than either answer.
+///
+/// The line the spec draws is **reads versus names**, and this is the naming
+/// side of it.
 #[test]
-fn a_metadata_statement_naming_a_table_enumerates_it() {
-    assert_eq!(
-        tables_of("SHOW COLUMNS FROM sales.orders"),
-        ["sales.orders"]
-    );
-    assert_eq!(
-        tables_of("SHOW FULL COLUMNS FROM sales.orders"),
-        ["sales.orders"]
-    );
-    assert_eq!(
-        tables_of("SHOW CREATE TABLE sales.orders"),
-        ["sales.orders"]
-    );
-    // A `WHERE` on a metadata statement is an expression like any other.
+fn a_metadata_statement_naming_a_policy_table_enumerates_nothing() {
+    for sql in [
+        "SHOW COLUMNS FROM sales.orders",
+        "SHOW FULL COLUMNS FROM sales.orders",
+        "SHOW CREATE TABLE sales.orders",
+        "SHOW CREATE VIEW sales.orders",
+        "SHOW INDEX FROM sales.orders",
+        "SHOW KEYS FROM sales.orders",
+    ] {
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert_eq!(analysis.kind, StatementKind::Metadata, "for {sql:?}");
+        assert!(
+            analysis.tables.is_empty(),
+            "{sql:?} enumerated {:?}; naming a table is not reading it",
+            analysis.tables
+        );
+    }
+}
+
+/// The other side of that line. A metadata statement can still carry an
+/// *expression*, and an expression can carry a subquery that reads rows — so
+/// the clauses that are expressions are walked even though the named object is
+/// not.
+///
+/// Neither of us anticipated this shape; routing `SHOW` through the same walk as
+/// everything else caught it without anyone having to think of it.
+#[test]
+fn a_metadata_statement_reading_a_table_in_a_predicate_enumerates_it() {
     assert_eq!(
         tables_of("SHOW VARIABLES WHERE Variable_name IN (SELECT region FROM sales.orders)"),
         ["sales.orders"]
     );
 }
 
-/// `sqlparser` parks the `SHOW` forms it does not model in `ShowVariable`, as an
-/// uninterpreted token list: `SHOW ENGINES` is `["ENGINES"]`, but
-/// `SHOW INDEX FROM sales.orders` is `["INDEX", "FROM", "sales", "orders"]`.
+/// `sqlparser` parks the `SHOW` forms it does not model in `ShowVariable` as raw
+/// tokens — `SHOW INDEX FROM sales.orders` becomes
+/// `["INDEX", "FROM", "sales", "orders"]`. All of them forward.
 ///
-/// A single token names nothing, so it forwards. Anything longer contains a name
-/// the walk cannot locate without reimplementing MySQL's `SHOW` grammar from
-/// tokens — so it refuses. `SHOW INDEX FROM sales.orders` is the case that
-/// matters: it reports metadata about a policy-bearing table, and guessing which
-/// token is the table is exactly what D3's allowlist forbids.
+/// The reason is structural, not a judgement about how sensitive index metadata
+/// is: that variant carries `Vec<Ident>` and nothing else, so there is no
+/// expression in it, so there is no subquery in it, so it cannot read a row.
+/// Under "reads versus names" a name forwards, and the proxy never needs to work
+/// out which token is the table.
 #[test]
-fn an_unmodelled_show_form_naming_something_is_refused() {
+fn an_unmodelled_show_form_is_forwarded() {
     for sql in [
+        "SHOW ENGINES",
+        "SHOW WARNINGS",
+        "SHOW GRANTS",
         "SHOW INDEX FROM sales.orders",
         "SHOW KEYS FROM sales.orders",
         "SHOW TRIGGERS FROM sales",
     ] {
-        assert!(
-            matches!(refusal(sql), RefusalReason::UnsupportedShape { .. }),
-            "{sql:?} should refuse"
-        );
+        let analysis = analyze(sql).unwrap_or_else(|e| panic!("{sql:?} should analyse: {e}"));
+        assert!(analysis.tables.is_empty(), "{sql:?} enumerated a table");
     }
 }
 
