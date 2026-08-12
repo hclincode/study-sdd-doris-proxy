@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use crate::config::ListenerConfig;
 use crate::logging::record::{outcome as outcome_str, CommandRecord};
 use crate::logging::writer::LogHandle;
-use crate::pipeline::{Pipeline, StageContext};
+use crate::pipeline::{FilterOutcome, Pipeline, StageContext};
 use crate::protocol::command::{Command, COM_QUIT};
 use crate::protocol::connection_phase::{self, err_payload, HandshakeError, Session};
 use crate::protocol::framing::{PacketReader, PacketWriter};
@@ -198,6 +198,18 @@ struct PendingRecord {
 
 impl PendingRecord {
     fn finish(self, conn: &ConnectionInfo, outcome: String) -> CommandRecord {
+        // A rewrite and a skip are mutually exclusive, and "no rule applied"
+        // leaves all four fields absent so records for unfiltered traffic keep
+        // the shape they had before row filtering existed.
+        let (rewritten, forwarded_statement, filter_table, filter_skipped) = match self.ctx.filter
+        {
+            FilterOutcome::NotApplicable => (false, None, None, None),
+            FilterOutcome::Rewritten { table, forwarded } => {
+                (true, Some(forwarded), Some(table), None)
+            }
+            FilterOutcome::Skipped(reason) => (false, None, None, Some(reason.as_str())),
+        };
+
         CommandRecord {
             ts: self.ts.to_rfc3339(),
             ts_unix_ms: self.ts.unix_ms,
@@ -220,6 +232,10 @@ impl PendingRecord {
             error_code: None,
             sql_state: None,
             error_message: None,
+            rewritten,
+            forwarded_statement,
+            filter_table,
+            filter_skipped,
         }
     }
 }

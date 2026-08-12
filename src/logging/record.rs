@@ -54,6 +54,22 @@ pub struct CommandRecord {
     pub sql_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Present and true when a row filter was injected. Absent means the
+    /// statement was forwarded as written, so records for traffic no rule
+    /// touched keep exactly the shape they had before row filtering existed.
+    #[serde(skip_serializing_if = "is_false")]
+    pub rewritten: bool,
+    /// The statement as forwarded to the backend. Present only on a rewrite;
+    /// `statement` always holds what the client submitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forwarded_statement: Option<String>,
+    /// The table whose rule was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_table: Option<String>,
+    /// Why a wanted rewrite did not happen. Present only when a rule plausibly
+    /// applied, so these can be counted as missing coverage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_skipped: Option<&'static str>,
 }
 
 /// Written whenever the discard counter has advanced, so a reader can tell the
@@ -105,7 +121,16 @@ mod tests {
             error_code: None,
             sql_state: None,
             error_message: None,
+            rewritten: false,
+            forwarded_statement: None,
+            filter_table: None,
+            filter_skipped: None,
         }
+    }
+
+    fn json(r: CommandRecord) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(&Record::Command(Box::new(r))).unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -145,6 +170,45 @@ mod tests {
         assert_eq!(v["digest_unavailable"], true);
         assert!(v.get("digest").is_none());
         assert_eq!(v["statement"], "SELECT * FROM t WHERE id = 1");
+    }
+
+    #[test]
+    fn a_rewritten_statement_reports_both_forms() {
+        let mut r = sample();
+        r.rewritten = true;
+        r.forwarded_statement =
+            Some("SELECT * FROM t WHERE ( id = 1) AND (tenant_id = 7)".into());
+        r.filter_table = Some("t".into());
+        let v = json(r);
+        assert_eq!(v["rewritten"], true);
+        assert_eq!(v["filter_table"], "t");
+        assert_eq!(
+            v["forwarded_statement"],
+            "SELECT * FROM t WHERE ( id = 1) AND (tenant_id = 7)"
+        );
+        assert_eq!(
+            v["statement"], "SELECT * FROM t WHERE id = 1",
+            "the client's own text must survive alongside the rewrite"
+        );
+        assert!(v.get("filter_skipped").is_none());
+    }
+
+    #[test]
+    fn a_skipped_rewrite_reports_a_reason_and_no_rewrite() {
+        let mut r = sample();
+        r.filter_skipped = Some("multiple_tables");
+        let v = json(r);
+        assert_eq!(v["filter_skipped"], "multiple_tables");
+        assert!(v.get("rewritten").is_none(), "absence means not rewritten");
+        assert!(v.get("forwarded_statement").is_none());
+    }
+
+    #[test]
+    fn traffic_no_rule_touched_keeps_its_original_shape() {
+        let v = json(sample());
+        for absent in ["rewritten", "forwarded_statement", "filter_table", "filter_skipped"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted");
+        }
     }
 
     #[test]

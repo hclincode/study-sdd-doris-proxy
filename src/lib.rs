@@ -5,5 +5,6 @@ pub mod logging;
 pub mod pipeline;
 pub mod protocol;
 pub mod proxy;
+pub mod row_filter;
 pub mod sql;
 pub mod timestamp;

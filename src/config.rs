@@ -4,7 +4,7 @@
 //! connections, which is acceptable at this stage and avoids having to reason
 //! about a live connection whose configuration changed underneath it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,11 @@ pub struct ListenerConfig {
     /// How many records may be queued before new ones are discarded.
     #[serde(default = "default_log_capacity")]
     pub log_channel_capacity: usize,
+    /// Row-filter rules: table name to a predicate appended to reads of that
+    /// table. A table with no entry is not filtered, and a listener with no
+    /// entries behaves exactly as one that predates this feature.
+    #[serde(default)]
+    pub row_filters: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -124,6 +129,24 @@ impl Config {
             resolve_one(&l.backend).map_err(|e| {
                 ConfigError::Invalid(format!("listener '{}' backend {}: {e}", l.name, l.backend))
             })?;
+
+            // Predicates are spliced into statements verbatim, so a malformed
+            // one must stop the proxy from starting rather than surface as
+            // broken SQL on every query against that table.
+            for (table, predicate) in &l.row_filters {
+                if table.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "listener '{}' has a row filter with an empty table name",
+                        l.name
+                    )));
+                }
+                crate::row_filter::validate_predicate(predicate).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "listener '{}' row filter for table '{}': {e}",
+                        l.name, table
+                    ))
+                })?;
+            }
         }
 
         Ok(())
@@ -286,6 +309,90 @@ mod tests {
             backend = "127.0.0.1:3306"
             log_file = "/tmp/a.jsonl"
             typo_key = true
+            "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_row_filter_rules() {
+        let c = parse(
+            r#"
+            [[listener]]
+            name = "primary"
+            bind = "127.0.0.1:13307"
+            backend = "127.0.0.1:3306"
+            log_file = "/tmp/a.jsonl"
+            row_filters = { orders = "tenant_id = 7", "shop.invoices" = "org = 7" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.listeners[0].row_filters.len(), 2);
+        assert_eq!(
+            c.listeners[0].row_filters.get("orders").map(String::as_str),
+            Some("tenant_id = 7")
+        );
+    }
+
+    #[test]
+    fn row_filters_default_to_empty_so_existing_configs_are_unchanged() {
+        let c = parse(
+            r#"
+            [[listener]]
+            name = "primary"
+            bind = "127.0.0.1:13307"
+            backend = "127.0.0.1:3306"
+            log_file = "/tmp/a.jsonl"
+            "#,
+        )
+        .unwrap();
+        assert!(c.listeners[0].row_filters.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_predicate_fails_startup_and_names_listener_and_table() {
+        let err = parse(
+            r#"
+            [[listener]]
+            name = "primary"
+            bind = "127.0.0.1:13307"
+            backend = "127.0.0.1:3306"
+            log_file = "/tmp/a.jsonl"
+            row_filters = { orders = "1=1; DROP TABLE orders" }
+            "#,
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("primary"), "{text}");
+        assert!(text.contains("orders"), "{text}");
+        assert!(text.contains("';'"), "{text}");
+    }
+
+    #[test]
+    fn rejects_a_predicate_with_a_trailing_comment() {
+        assert!(parse(
+            r#"
+            [[listener]]
+            name = "primary"
+            bind = "127.0.0.1:13307"
+            backend = "127.0.0.1:3306"
+            log_file = "/tmp/a.jsonl"
+            row_filters = { orders = "tenant_id = 7 -- note" }
+            "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_table_name() {
+        assert!(parse(
+            r#"
+            [[listener]]
+            name = "primary"
+            bind = "127.0.0.1:13307"
+            backend = "127.0.0.1:3306"
+            log_file = "/tmp/a.jsonl"
+            row_filters = { "" = "tenant_id = 7" }
             "#
         )
         .is_err());

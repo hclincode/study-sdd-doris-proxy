@@ -13,7 +13,24 @@
 use std::borrow::Cow;
 
 use crate::protocol::command::Command;
+use crate::sql::analyze::SkipReason;
 use crate::sql::digest::{digest, Digest};
+
+/// What the row filter did with a command.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum FilterOutcome {
+    /// No rule was involved: the command carries no SQL, reads no table, or
+    /// reads a table nobody configured a filter for. Deliberately distinct from
+    /// a skip, so that skip counts measure filters that were wanted and did not
+    /// happen rather than traffic nobody meant to filter.
+    #[default]
+    NotApplicable,
+    Rewritten {
+        table: String,
+        forwarded: String,
+    },
+    Skipped(SkipReason),
+}
 
 /// Per-command scratch space shared by stages and read by the logger once the
 /// response completes.
@@ -22,6 +39,7 @@ pub struct StageContext {
     pub digest: Option<Digest>,
     /// Set when the statement carried SQL that could not be normalized.
     pub digest_unavailable: bool,
+    pub filter: FilterOutcome,
 }
 
 /// What a stage decided to do with the command.

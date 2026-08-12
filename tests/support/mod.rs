@@ -18,7 +18,8 @@ use tokio::sync::watch;
 
 use mysql_proxy::config::ListenerConfig;
 use mysql_proxy::logging::writer;
-use mysql_proxy::pipeline::Pipeline;
+use mysql_proxy::pipeline::{ObserveStage, Pipeline};
+use mysql_proxy::row_filter::{RowFilterStage, RuleSet};
 use mysql_proxy::protocol::capabilities::*;
 use mysql_proxy::proxy::{self, ListenerContext};
 
@@ -101,6 +102,19 @@ pub const MOCK_SERVER_CAPS: u32 = CLIENT_PROTOCOL_41
 pub struct MockBackend {
     pub addr: SocketAddr,
     pub connections: Arc<AtomicU64>,
+    /// Statement text as it actually arrived, so tests can assert what the
+    /// proxy forwarded rather than only what the client sent.
+    pub statements: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockBackend {
+    pub fn seen(&self) -> Vec<String> {
+        self.statements.lock().unwrap().clone()
+    }
+
+    pub fn last_statement(&self) -> String {
+        self.seen().last().cloned().unwrap_or_default()
+    }
 }
 
 impl MockBackend {
@@ -118,6 +132,8 @@ impl MockBackend {
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU64::new(0));
         let counter = Arc::clone(&connections);
+        let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&statements);
 
         tokio::spawn(async move {
             loop {
@@ -125,15 +141,29 @@ impl MockBackend {
                     return;
                 };
                 counter.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(serve_backend(stream, caps, connection_id));
+                tokio::spawn(serve_backend(
+                    stream,
+                    caps,
+                    connection_id,
+                    Arc::clone(&seen),
+                ));
             }
         });
 
-        MockBackend { addr, connections }
+        MockBackend {
+            addr,
+            connections,
+            statements,
+        }
     }
 }
 
-async fn serve_backend(mut stream: TcpStream, caps: u32, connection_id: u32) {
+async fn serve_backend(
+    mut stream: TcpStream,
+    caps: u32,
+    connection_id: u32,
+    statements: Arc<std::sync::Mutex<Vec<String>>>,
+) {
     // Initial handshake.
     let mut p = vec![10];
     p.extend_from_slice(b"8.0.36-mock\0");
@@ -168,9 +198,26 @@ async fn serve_backend(mut stream: TcpStream, caps: u32, connection_id: u32) {
         let reply_seq = seq.wrapping_add(1);
         let code = payload.first().copied().unwrap_or(0);
 
+        if matches!(code, 0x03 | 0x16) {
+            statements
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&payload[1..]).to_string());
+        }
+
         let response: Vec<Vec<u8>> = match code {
             0x01 => return, // COM_QUIT
             0x0E => vec![ok_packet()],
+            // COM_STMT_PREPARE: a header claiming no parameters and no columns.
+            0x16 => {
+                let mut header = vec![0x00];
+                header.extend_from_slice(&1u32.to_le_bytes());
+                header.extend_from_slice(&0u16.to_le_bytes());
+                header.extend_from_slice(&0u16.to_le_bytes());
+                header.push(0x00);
+                header.extend_from_slice(&0u16.to_le_bytes());
+                vec![header]
+            }
             0x03 => {
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 if sql.trim() == "fail" {
@@ -327,6 +374,15 @@ pub struct RunningProxy {
 
 impl RunningProxy {
     pub async fn start(backend: SocketAddr, capacity: usize) -> RunningProxy {
+        Self::start_with_filters(backend, capacity, &[]).await
+    }
+
+    /// Starts a proxy whose listener carries the given row-filter rules.
+    pub async fn start_with_filters(
+        backend: SocketAddr,
+        capacity: usize,
+        filters: &[(&str, &str)],
+    ) -> RunningProxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -341,12 +397,17 @@ impl RunningProxy {
             NEXT_LOG.fetch_add(1, Ordering::Relaxed)
         ));
 
+        let row_filters: std::collections::HashMap<String, String> = filters
+            .iter()
+            .map(|(t, p)| (t.to_string(), p.to_string()))
+            .collect();
         let config = ListenerConfig {
             name: "test".into(),
             bind: addr.to_string(),
             backend: backend.to_string(),
             log_file: log_path.clone(),
             log_channel_capacity: capacity,
+            row_filters: row_filters.clone(),
         };
 
         let reopen = Arc::new(tokio::sync::Notify::new());
@@ -359,11 +420,21 @@ impl RunningProxy {
         .await
         .unwrap();
 
+        let rules = RuleSet::compile(&row_filters).expect("filters should compile");
+        let pipeline = if rules.is_empty() {
+            Pipeline::observe_only()
+        } else {
+            Pipeline::new(vec![
+                Box::new(ObserveStage),
+                Box::new(RowFilterStage::new(rules)),
+            ])
+        };
+
         let (shutdown, shutdown_rx) = watch::channel(false);
         let ctx = Arc::new(ListenerContext {
             config,
             log,
-            pipeline: Arc::new(Pipeline::observe_only()),
+            pipeline: Arc::new(pipeline),
         });
         tokio::spawn(proxy::serve(listener, ctx, shutdown_rx));
 

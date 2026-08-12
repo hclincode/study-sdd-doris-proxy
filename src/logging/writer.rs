@@ -230,6 +230,10 @@ mod tests {
             error_code: None,
             sql_state: None,
             error_message: None,
+            rewritten: false,
+            forwarded_statement: None,
+            filter_table: None,
+            filter_skipped: None,
         }
     }
 

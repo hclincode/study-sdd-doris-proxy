@@ -52,6 +52,9 @@ bind = "127.0.0.1:3307"           # where clients connect
 backend = "db.internal:3306"      # where their traffic goes
 log_file = "/var/log/mysql-proxy/primary.jsonl"
 log_channel_capacity = 8192       # optional; queued records before discarding
+
+# Optional row filters: table -> predicate. See "Row filters" below.
+row_filters = { orders = "tenant_id = 7", "shop.invoices" = "org_id = 7" }
 ```
 
 Configuration is read once at startup. There is no reload — restart to apply
@@ -100,6 +103,14 @@ One JSON object per line, appended to `log_file`. Records with `"type":
 | `affected_rows` / `returned_rows` | Present according to the outcome |
 | `error_code`, `sql_state`, `error_message` | Present when the backend returned an error |
 | `digest_unavailable` | Present and `true` when the statement could not be normalized |
+| `rewritten` | Present and `true` when a row filter was injected |
+| `forwarded_statement` | What was actually sent to the backend, on a rewrite |
+| `filter_table` | The table whose rule was applied |
+| `filter_skipped` | Why a wanted rewrite did not happen (see [Row filters](#row-filters)) |
+
+The last four are omitted entirely for traffic no rule touched, so records from
+an unfiltered listener have exactly the shape they had before row filtering
+existed. `statement` always holds what the client submitted, even on a rewrite.
 
 Records with `"type": "dropped"` report discards:
 
@@ -141,6 +152,87 @@ just a disk-space one. The proxy creates it with owner-only permissions (`0600`)
 retention and access are yours to set, and should be driven by a data-retention
 policy rather than by how much disk you have.
 
+## Row filters
+
+A listener can append a predicate to reads of a given table, so a client
+connecting through it sees only the matching rows without the application
+needing to write the filter itself.
+
+```toml
+[[listener]]
+name = "tenant-7"
+bind = "127.0.0.1:3307"
+backend = "db.internal:3306"
+log_file = "/var/log/mysql-proxy/tenant-7.jsonl"
+row_filters = { orders = "tenant_id = 7", invoices = "tenant_id = 7" }
+```
+
+```
+   client sends:   SELECT * FROM orders WHERE a = 1 OR b = 2
+   backend gets:   SELECT * FROM orders WHERE (a = 1 OR b = 2) AND (tenant_id = 7)
+                                              ▲              ▲
+                     both sides parenthesized, always — without this, AND binds
+                     tighter than OR and the filter would widen the result set
+```
+
+Rules are matched case-insensitively with backticks stripped. A qualified rule
+(`shop.orders`) matches only a qualified reference; a bare rule (`orders`)
+matches either, and a qualified rule wins when both could apply. A table with no
+rule is never filtered.
+
+Predicates are validated when the proxy starts and must be a single complete
+boolean expression. A predicate containing `;`, `?`, a comment, or unbalanced
+parentheses is a **boot failure**, not a query-time surprise. Treat the config
+file as you would code: its contents are spliced into statements verbatim.
+
+### What gets rewritten
+
+Only a `SELECT` reading exactly one table that has a rule, submitted either
+directly or for preparation. Everything else is **forwarded unchanged** and
+recorded with a reason:
+
+| `filter_skipped` | Meaning |
+| --- | --- |
+| `multiple_tables` | A join, or a comma-separated table list |
+| `unsupported_structure` | A subquery, `UNION`, CTE, derived table, or index hint |
+| `not_select` | A write, DDL, `SHOW`, `CALL`, or anything else |
+| `multiple_statements` | More than one statement in a single command |
+| `tokenize_failed` | The statement could not be lexed |
+| `no_insertion_point` | The clause boundary could not be located |
+| `packet_count_changed` | The rewrite would cross a 16 MB packet boundary |
+
+A skip is recorded only when a ruled table is mentioned, so the count measures
+filters that were wanted and did not happen — not traffic nobody meant to
+filter. Grouping records by `filter_skipped` tells you which construct your real
+traffic uses, which is the input to deciding whether to support it.
+
+### This is not a security control
+
+**A statement the proxy cannot rewrite returns unfiltered rows.** That is the
+designed behaviour, not a defect: the filter never breaks a query, and it
+therefore cannot contain one. Three consequences follow:
+
+- Any skip above — including a statement that merely failed to lex — means the
+  client received rows the predicate would have excluded.
+- Views, stored procedures, `PREPARE … FROM @variable`, and `HANDLER` hide the
+  table name, so no rule can match them.
+- Whoever can reach a listener's port gets that listener's filter, and nothing
+  else enforces it.
+
+Use it to prevent accidental cross-tenant reads in ordinary application traffic.
+**The backend's `GRANT`s remain the only access control**, and should be set as
+though the proxy were not there.
+
+### Rolling out a rule safely
+
+The failure mode is silent, so verify before anything depends on it:
+
+1. Add the rule to a non-production listener pointing at the same backend.
+2. Run the application's real queries through it.
+3. Read the log. `forwarded_statement` shows what each rewrite became, and
+   `filter_skipped` shows what the rule failed to cover.
+4. Compare row counts against an unfiltered listener for the queries that matter.
+
 ## Operational posture
 
 **The proxy must run on a trusted network segment.** Three properties combine to
@@ -156,6 +248,8 @@ make that a requirement rather than a recommendation:
   nobody. Authentication is relayed end-to-end between client and backend, so
   **the backend's own `GRANT`s remain the only access control.** The proxy adds
   visibility, not authorization.
+- **Row filters are best-effort.** See [Row filters](#row-filters): a statement
+  the proxy cannot rewrite is forwarded unfiltered.
 - **One backend connection per client connection.** Connections are sticky and
   never shared, so session state cannot leak between clients — but connection
   pressure on MySQL roughly doubles compared to clients connecting directly.
@@ -199,12 +293,13 @@ log rotation.
 src/
   protocol/     framing, capabilities, connection phase, command classification,
                 response state machine
-  sql/          tokenizer and digest normalization
+  sql/          tokenizer, digest normalization, statement shape analysis
   pipeline.rs   the request-side stage pipeline
+  row_filter.rs predicate validation, rule matching, splicing, the filter stage
   logging/      record types and the writer task
   proxy.rs      accept loop and command loop
   config.rs     TOML configuration
 ```
 
 The design notes, including why each of the above is shaped the way it is, are in
-`openspec/changes/add-mysql-proxy-query-logging/design.md`.
+`openspec/changes/archive/`.

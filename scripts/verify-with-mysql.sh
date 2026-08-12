@@ -16,6 +16,8 @@ cd "$(dirname "$0")/.."
 PROXY_PORT=13307
 DB_PORT=13306
 LOG_FILE="$(mktemp -t mysql-proxy-verify).jsonl"
+FILTER_LOG="$(mktemp -t mysql-proxy-filtered).jsonl"
+FILTER_PORT=13308
 CONFIG="$(mktemp -t mysql-proxy-verify-config).toml"
 MYSQL_IMAGE=mysql:8.0
 
@@ -63,6 +65,16 @@ name = "verify"
 bind = "0.0.0.0:$PROXY_PORT"
 backend = "127.0.0.1:$DB_PORT"
 log_file = "$LOG_FILE"
+
+# The same backend, reached through a listener that filters \`orders\` to one
+# tenant. Comparing the two ports is what makes row-visibility assertions
+# meaningful.
+[[listener]]
+name = "filtered"
+bind = "0.0.0.0:$FILTER_PORT"
+backend = "127.0.0.1:$DB_PORT"
+log_file = "$FILTER_LOG"
+row_filters = { orders = "tenant_id = 7" }
 EOF
 ./target/debug/mysql-proxy "$CONFIG" &
 PROXY_PID=$!
@@ -82,6 +94,15 @@ mysql_client "$PROXY_PORT" shop >/dev/null 2>&1 <<'SQL'
 DROP TABLE IF EXISTS orders;
 CREATE TABLE orders (id INT PRIMARY KEY, tenant_id INT, note VARCHAR(64));
 INSERT INTO orders VALUES (1,7,'a'),(2,7,'b'),(3,8,'c');
+DROP TABLE IF EXISTS items;
+CREATE TABLE items (id INT PRIMARY KEY, oid INT, label VARCHAR(64));
+INSERT INTO items VALUES (10,1,'i1'),(11,2,'i2'),(12,3,'i3');
+SQL
+
+docker exec -i mysql-proxy-test-db mysql -uroot -prootpw >/dev/null 2>&1 <<'SQL'
+CREATE USER IF NOT EXISTS 'app_native'@'%' IDENTIFIED WITH mysql_native_password BY 'apppw';
+GRANT ALL ON shop.* TO 'app_native'@'%';
+FLUSH PRIVILEGES;
 SQL
 rows=$(mysql_client "$PROXY_PORT" -N -B -e "SELECT COUNT(*) FROM orders" shop 2>/dev/null)
 [[ "$rows" == "3" ]] && ok "DDL, INSERT and SELECT round-trip" || bad "expected 3 rows, got '$rows'"
@@ -163,6 +184,103 @@ if mysql_client "$PROXY_PORT" -e "CHANGE USER" shop >/dev/null 2>&1; then
   : # syntax error either way; the COM_CHANGE_USER path is covered by unit tests
 fi
 ok "replication and user-change commands are covered by the Rust test suite"
+
+
+# ---------------------------------------------------------------- row filters
+#
+# Every assertion here is about which rows come back, not about SQL text. A
+# missing pair of parentheses produces a perfectly reasonable looking statement,
+# so only row counts can catch it.
+
+filtered_query() {
+  docker run --rm -i "$MYSQL_IMAGE" mysql -h host.docker.internal -P "$FILTER_PORT" \
+    -u app -papppw --ssl-mode=DISABLED --get-server-public-key -N -B -e "$1" shop 2>/dev/null
+}
+unfiltered_query() {
+  mysql_client "$PROXY_PORT" -N -B -e "$1" shop 2>/dev/null
+}
+
+note "Row filter: visibility"
+# orders holds 2 rows for tenant 7 and 1 for tenant 8.
+all=$(unfiltered_query "SELECT COUNT(*) FROM orders")
+mine=$(filtered_query "SELECT COUNT(*) FROM orders")
+[[ "$all" == "3" && "$mine" == "2" ]] \
+  && ok "plain select returns only the filtered tenant's rows ($mine of $all)" \
+  || bad "expected 2 of 3, got '$mine' of '$all'"
+
+mine=$(filtered_query "SELECT COUNT(*) FROM orders WHERE note = 'a'")
+[[ "$mine" == "1" ]] && ok "select with an existing WHERE stays filtered" \
+                     || bad "expected 1, got '$mine'"
+
+# The precedence case. Unfiltered this matches 'a' (tenant 7) and 'c' (tenant 8).
+# Without parentheses around the original condition the filter would bind only
+# to the second alternative and 'c' would leak through.
+all=$(unfiltered_query "SELECT COUNT(*) FROM orders WHERE note = 'a' OR note = 'c'")
+mine=$(filtered_query "SELECT COUNT(*) FROM orders WHERE note = 'a' OR note = 'c'")
+[[ "$all" == "2" && "$mine" == "1" ]] \
+  && ok "OR condition is parenthesized, so the filter narrows rather than widens" \
+  || bad "precedence leak: unfiltered '$all', filtered '$mine' (expected 2 and 1)"
+
+mine=$(filtered_query "SELECT note FROM orders ORDER BY id LIMIT 5" | tr '\n' ' ' | xargs)
+[[ "$mine" == "a b" ]] && ok "ORDER BY and LIMIT survive the injection" \
+                       || bad "expected 'a b', got '$mine'"
+
+mine=$(filtered_query "SELECT COUNT(*) FROM orders o WHERE o.id > 0")
+[[ "$mine" == "2" ]] && ok "aliased table is still filtered" || bad "expected 2, got '$mine'"
+
+note "Row filter: best-effort skips"
+all=$(unfiltered_query "SELECT COUNT(*) FROM orders o JOIN items i ON o.id = i.oid")
+mine=$(filtered_query "SELECT COUNT(*) FROM orders o JOIN items i ON o.id = i.oid")
+[[ "$all" == "3" && "$mine" == "3" ]] \
+  && ok "a join is forwarded unfiltered, as specified" \
+  || bad "expected the join to return 3 either way, got '$mine' of '$all'"
+
+mine=$(filtered_query "SELECT COUNT(*) FROM items")
+[[ "$mine" == "3" ]] && ok "a table with no rule is unaffected" || bad "expected 3, got '$mine'"
+
+note "Row filter: prepared statements (binary protocol)"
+# The mysql CLI's PREPARE is server-side dynamic SQL, which the proxy cannot
+# see into. A real driver issuing COM_STMT_PREPARE is needed to exercise the
+# path this feature actually rewrites.
+prep=$(docker run --rm -i python:3.12-slim sh -c "
+pip install --quiet mysql-connector-python >/dev/null 2>&1
+python - <<'PYEOF'
+import mysql.connector
+c = mysql.connector.connect(host='host.docker.internal', port=$FILTER_PORT,
+                            user='app_native', password='apppw', database='shop')
+cur = c.cursor(prepared=True)
+cur.execute('SELECT COUNT(*) FROM orders WHERE note = %s', ('a',))
+with_param = cur.fetchone()[0]
+cur2 = c.cursor(prepared=True)
+cur2.execute('SELECT id, tenant_id, note FROM orders')
+rows = cur2.fetchall()
+print(f'{with_param} {len(rows)} {len(rows[0])}')
+PYEOF
+" 2>/dev/null | tail -1)
+if [[ "$prep" == "1 2 3" ]]; then
+  ok "prepared statement is filtered, with parameter and column counts unchanged"
+else
+  bad "prepared statement gave '$prep' (expected '1 2 3')"
+fi
+
+note "Row filter: log records"
+sleep 1
+if python3 -c "
+import json
+rows=[json.loads(l) for l in open('$FILTER_LOG') if l.strip()]
+cmds=[r for r in rows if r.get('type')=='command']
+rew=[r for r in cmds if r.get('rewritten')]
+skipped=[r for r in cmds if r.get('filter_skipped')]
+assert rew, 'no rewritten records'
+assert any('tenant_id = 7' in r.get('forwarded_statement','') for r in rew), 'predicate missing from forwarded text'
+assert all('tenant_id = 7' not in r.get('statement','') for r in rew), 'client text was altered'
+assert any(r['filter_skipped']=='multiple_tables' for r in skipped), 'join not recorded as a skip'
+assert not any(r.get('filter_skipped') for r in cmds if 'FROM items' in r.get('statement','')), 'unruled table counted as a skip'
+" >/dev/null 2>&1; then
+  ok "records carry both statements, the rule applied, and skip reasons"
+else
+  bad "filtered log records did not have the expected shape"
+fi
 
 note "Log rotation"
 sleep 1

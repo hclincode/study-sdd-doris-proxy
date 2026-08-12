@@ -14,8 +14,9 @@ use tokio::sync::{watch, Notify};
 
 use mysql_proxy::config::Config;
 use mysql_proxy::logging::writer;
-use mysql_proxy::pipeline::Pipeline;
+use mysql_proxy::pipeline::{ObserveStage, Pipeline};
 use mysql_proxy::proxy::{self, ListenerContext};
+use mysql_proxy::row_filter::{RowFilterStage, RuleSet};
 
 const USAGE: &str = "usage: mysql-proxy <config.toml>";
 
@@ -74,12 +75,35 @@ async fn run(config_path: PathBuf) -> Result<(), String> {
             )
         })?;
 
+        // Predicates were already validated when the configuration loaded, so
+        // this should not fail; it is checked rather than unwrapped because a
+        // bad rule must never reach a client.
+        let rules = RuleSet::compile(&listener_config.row_filters).map_err(|(table, e)| {
+            format!(
+                "listener '{}' row filter for table '{}': {e}",
+                listener_config.name, table
+            )
+        })?;
+
+        // A listener without rules keeps the phase-one pipeline exactly, so it
+        // does no statement analysis at all.
+        let pipeline = if rules.is_empty() {
+            Pipeline::observe_only()
+        } else {
+            // The observer runs first so the digest describes the statement the
+            // client submitted, not the rewritten one.
+            Pipeline::new(vec![
+                Box::new(ObserveStage),
+                Box::new(RowFilterStage::new(rules)),
+            ])
+        };
+
         prepared.push((
             socket,
             Arc::new(ListenerContext {
                 config: listener_config.clone(),
                 log,
-                pipeline: Arc::new(Pipeline::observe_only()),
+                pipeline: Arc::new(pipeline),
             }),
         ));
     }
@@ -87,11 +111,16 @@ async fn run(config_path: PathBuf) -> Result<(), String> {
     let mut serving = Vec::new();
     for (socket, ctx) in prepared {
         eprintln!(
-            "listener '{}' proxying {} -> {}, logging to {}",
+            "listener '{}' proxying {} -> {}, logging to {}{}",
             ctx.config.name,
             ctx.config.bind,
             ctx.config.backend,
-            ctx.config.log_file.display()
+            ctx.config.log_file.display(),
+            if ctx.config.row_filters.is_empty() {
+                String::new()
+            } else {
+                format!(", row filters on {} table(s)", ctx.config.row_filters.len())
+            }
         );
         serving.push(tokio::spawn(proxy::serve(socket, ctx, shutdown_rx.clone())));
     }
