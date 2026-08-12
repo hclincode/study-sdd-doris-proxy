@@ -1,0 +1,22 @@
+# One proxy process, two listeners, two different database engines behind them.
+#
+# Both carry the same rule: reads of `orders` are narrowed to the EU region.
+# Nothing here is engine-specific — the proxy does not know, and does not need
+# to know, that one backend is MySQL and the other is Doris.
+#
+# Paths are relative to the repository root; the demo scripts run the proxy
+# from there.
+
+[[listener]]
+name = "mysql-filtered"
+bind = "0.0.0.0:13307"
+backend = "127.0.0.1:13306"
+log_file = "demo/logs/mysql.jsonl"
+row_filters = { orders = "region = 'EU'" }
+
+[[listener]]
+name = "doris-filtered"
+bind = "0.0.0.0:13308"
+backend = "127.0.0.1:9030"
+log_file = "demo/logs/doris.jsonl"
+row_filters = { orders = "region = 'EU'" }

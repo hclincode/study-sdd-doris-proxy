@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-12
+# Demo scripts only: no proxy behaviour changes, so no capability delta exists.
+skip_specs: true
