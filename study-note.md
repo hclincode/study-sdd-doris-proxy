@@ -30,3 +30,20 @@ ref: [superpower github](https://github.com/obra/superpowers)
 
 結果看起來 task 不斷放大．兩三次 token limit 後都還沒辦法結束任務．
 猜想是任務太大了，打算重做從 explore 開始先給比較小的任務，再放大成 sql rewrite．
+
+# milestone-3
+model 會讀到太多資訊，以至於沒辦法用一個很乾淨的前提開始．決定直接在其他地方開一個 folder 開始．
+
+## opsx
+opsx:explore 體驗不錯，幫助我了解一些需要考慮的事情．
+有個選擇可以 opsx:new 然後 opsx:continue 一步一步往下做跟確認．但看 explore 的討論似乎比較確定了，決定直接 opsx:propose
+
+## practice
+phase 1 做了 SQL logging
+phase 2 做了 SQL rewrite row filter for select
+
+phase 3 (project 3) demo case
+
+## result
+phase 1 ~ 3 沒有使用 agent teams 功能
+token 消耗跟 phase 2 比起還有顯著差異

@@ -1,6 +1,6 @@
 # Discussion: What actually caught defects in milestone 2
 
-**Date:** 2026-08-10 · **Status:** open — update as milestone 2 continues
+**Date:** 2026-08-10 · **Status:** closed 2026-08-11 with the milestone — a record, not a living document
 **Context:** building the row-filter proxy MVP with OpenSpec, four agents in parallel
 
 Milestone 1 concluded that neither OpenSpec nor Spec Kit enforces anything
