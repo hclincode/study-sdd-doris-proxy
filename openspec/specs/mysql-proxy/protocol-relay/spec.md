@@ -2,7 +2,7 @@
 
 Defines how the proxy accepts MySQL client connections, relays them to a backend MySQL server without participating in authentication, and stays synchronized with the wire protocol so that every command and its response can be observed.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Listener accepts clients and pairs each with one backend connection
 
@@ -56,7 +56,7 @@ The proxy SHALL NOT authenticate clients and SHALL NOT store, derive, or require
 
 ### Requirement: Unsupported capabilities are masked from the negotiation
 
-The proxy SHALL clear the `CLIENT_SSL`, `CLIENT_COMPRESS`, and `CLIENT_LOCAL_FILES` capability bits from the backend's advertised capabilities before forwarding the initial handshake to the client, so that no connection negotiates encryption, compression, or client-side file loading. The proxy SHALL record the capability flags actually negotiated for each connection, because response framing depends on them.
+The proxy SHALL clear the `CLIENT_SSL`, `CLIENT_COMPRESS`, and `CLIENT_LOCAL_FILES` capability bits from the backend's advertised capabilities before forwarding the initial handshake to the client, so that no connection negotiates encryption, compression, or client-side file loading. It SHALL also clear those bits from the client's handshake response before forwarding it to the backend, so that neither side believes a masked capability is in force. The proxy SHALL record the capability flags actually negotiated for each connection, because response framing depends on them.
 
 #### Scenario: Backend advertises TLS support
 
@@ -64,9 +64,16 @@ The proxy SHALL clear the `CLIENT_SSL`, `CLIENT_COMPRESS`, and `CLIENT_LOCAL_FIL
 - **THEN** the proxy forwards a handshake to the client with `CLIENT_SSL` cleared
 - **AND** a client configured to prefer TLS proceeds over an unencrypted connection
 
-#### Scenario: Client insists on a masked capability
+#### Scenario: Client advertises a masked capability
 
-- **WHEN** a client's handshake response sets `CLIENT_SSL`, `CLIENT_COMPRESS`, or `CLIENT_LOCAL_FILES` despite the proxy not advertising it
+- **WHEN** a client's handshake response sets a masked capability such as `CLIENT_LOCAL_FILES`, which clients advertise according to what they support rather than what the server offered
+- **THEN** the proxy clears that bit before forwarding the response to the backend
+- **AND** the connection proceeds normally
+- **AND** the backend does not treat the capability as negotiated
+
+#### Scenario: Client attempts a TLS upgrade
+
+- **WHEN** a client's handshake response sets `CLIENT_SSL`, meaning it will begin a TLS handshake immediately
 - **THEN** the proxy closes the connection rather than forwarding the response to the backend
 
 #### Scenario: Client requires TLS
