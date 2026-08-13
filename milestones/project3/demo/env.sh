@@ -8,8 +8,9 @@
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$REPO_ROOT/demo"
 
-# Where the two engines are. Both are expected to be running already; the
-# setup script detects them rather than starting them.
+# Where the two engines are. Both are expected to be running by the time
+# 01-setup.sh runs; it detects them rather than starting them. MySQL comes from
+# the repository's docker-compose.yml, Doris from 00-doris-up.sh.
 MYSQL_PORT=13306
 MYSQL_USER=app
 MYSQL_PASS=apppw
@@ -17,6 +18,13 @@ MYSQL_PASS=apppw
 DORIS_PORT=9030
 DORIS_USER=root
 DORIS_PASS=""            # Doris ships with root and no password
+
+# The Doris container 00-doris-up.sh manages. Nothing else reads these, but
+# they live here so there is one place to point the demo at a different Doris.
+DORIS_CONTAINER=doris-demo
+DORIS_IMAGE=apache/doris:doris-all-in-one-2.1.0
+DORIS_HTTP_PORT=8030     # FE web UI; not used by the demo, useful when it sulks
+DORIS_READY_TIMEOUT=${DORIS_READY_TIMEOUT:-900}
 
 # The proxy's two front doors, one per backend.
 PROXY_MYSQL_PORT=13307
@@ -98,6 +106,14 @@ run_query_file() {
 }
 
 # Counts rows the shared query returns, without the table decoration.
+#
+# Note what this actually does: it issues its own `SELECT COUNT(*)`, a second
+# statement, rather than counting the lines the displayed query printed. That is
+# deliberate and it is honest in both directions — through a proxied listener
+# the COUNT(*) is itself a single-table read of a ruled table, so it is rewritten
+# by the same rule and reports the same three rows the client saw. If it ever
+# disagrees with the visible output, the filter is applying inconsistently
+# between two statements, and that is worth knowing rather than hiding.
 count_rows() {
   local fn="$1"
   "$fn" -D "$DB" -N -B -e "SELECT COUNT(*) FROM $TABLE" | tr -d '[:space:]'

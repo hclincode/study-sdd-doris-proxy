@@ -22,19 +22,28 @@ are narrowed to `region = 'EU'`.
 ## Running it
 
 ```bash
+./demo/00-doris-up.sh   # brings up Doris and waits for it — the slow one
+docker compose up -d    # brings up MySQL — takes seconds
 ./demo/01-setup.sh      # BEFORE the presentation — see timing below
 ./demo/02-direct.sh     # cases 1-1 and 2-1
 ./demo/03-proxied.sh    # cases 1-2 and 2-2
 ./demo/01-setup.sh --stop   # afterwards; leaves the engines running
+./demo/00-doris-up.sh --stop   # and this, to put Doris down too
 ```
 
 ### Timing matters
 
-**Run `01-setup.sh` well before you present — never during.** It is the only
-slow step, and it is the one that can fail. It does not start the database
-engines and does not wait for them: Doris needs several minutes after launch
-before it accepts connections, and that is not a wait you want in front of an
-audience.
+**Run `00-doris-up.sh` and `01-setup.sh` well before you present — never
+during.** Between them they hold every slow step and every step that can fail.
+
+`00-doris-up.sh` is where the waiting lives. Doris needs several minutes after
+launch before it will accept a `CREATE TABLE`, and it accepts *connections*
+well before that — the frontend answers while no backend has registered yet, so
+a seed issued too early fails with `Failed to find enough backend`. The script
+waits for both, and `--status` reports which of the two you are waiting on.
+
+`01-setup.sh` deliberately does neither: it detects the engines rather than
+starting them, so it stays fast and its failures mean something.
 
 The script ends with a readiness table covering all four cases and exits
 non-zero if any of them is wrong. That check exists because **the proxy is not
@@ -46,16 +55,21 @@ adjust the story.
 
 ## Prerequisites
 
-| | where | credentials |
-| --- | --- | --- |
-| MySQL 8 | `127.0.0.1:13306` | `app` / `apppw` |
-| Apache Doris | `127.0.0.1:9030` | `root`, no password |
-| Docker | for the `mysql` command-line client, which the host does not have |
+| | where | credentials | brought up by |
+| --- | --- | --- | --- |
+| MySQL 8 | `127.0.0.1:13306` | `app` / `apppw` | `docker compose up -d` |
+| Apache Doris | `127.0.0.1:9030` | `root`, no password | `./demo/00-doris-up.sh` |
+| Docker | for the `mysql` command-line client, which the host does not have | | |
 
-MySQL comes from the repository's `docker-compose.yml` (`docker compose up -d`).
-Doris you supply yourself; the scripts detect it rather than starting it.
+The Doris image is about 11 GB, so the first run of `00-doris-up.sh` pulls for a
+while before it starts anything. It manages a container named `doris-demo` and
+leaves any other Doris alone: if something already serves port 9030 — your own
+container, or a Doris outside Docker — the script uses it as-is and says so,
+and its `--stop` and `--rm` then have nothing of yours to touch.
 
-Endpoints and credentials live in `demo/env.sh` — change them in one place.
+Endpoints, credentials, the container name and the readiness timeout all live in
+`demo/env.sh` — change them in one place. `DORIS_READY_TIMEOUT=1800
+./demo/00-doris-up.sh` waits longer on a slow machine.
 
 ## What each case shows
 
@@ -123,6 +137,7 @@ Things worth saying out loud if someone asks:
   proxy.toml           one proxy, two listeners, one rule
   env.sh               endpoints, credentials, shared helpers
   inspect-server.py    reads a server's handshake and reports what it is
+  00-doris-up.sh       start Doris and wait until it can actually serve DDL
   01-setup.sh          detect, seed, start, verify all four cases
   02-direct.sh         cases 1-1 and 2-1
   03-proxied.sh        cases 1-2 and 2-2

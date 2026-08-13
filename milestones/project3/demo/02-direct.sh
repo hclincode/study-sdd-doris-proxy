@@ -13,6 +13,11 @@ run_case() {
 
   heading "$label — $endpoint"
   printf '  %sthe query:%s\n' "$DIM" "$RESET"
+  # Displayed from the file both scripts execute, with its comment lines and
+  # blanks stripped for the screen. Printing a copy typed into this script
+  # would be the easy version and would prove nothing — the audience is being
+  # told all four cases run identical SQL, so the SQL on screen has to be the
+  # SQL that ran.
   grep -v '^--' "$DEMO_DIR/query.sql" | grep -v '^\s*$' | sed 's/^/    /'
   echo
 

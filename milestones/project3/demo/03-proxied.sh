@@ -11,6 +11,17 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # Prints the most recent rewritten statement recorded by a listener.
+#
+# The evidence comes from the proxy's own log, not from this script: it reads
+# the JSONL the proxy wrote and prints the `forwarded_statement` field of the
+# last record flagged `rewritten`. Nothing here reconstructs what the rewrite
+# ought to have been, which is the whole point — a script that printed its own
+# idea of the expected SQL would keep printing it after the rewriter broke.
+#
+# An empty result is therefore meaningful and is not an error: it means no
+# record in that log claims a rewrite happened. The caller prints the rows
+# either way, so a filter that silently stopped applying shows up as a missing
+# statement line next to eight rows instead of three.
 forwarded_statement() {
   python3 - "$1" <<'PY'
 import json, sys
